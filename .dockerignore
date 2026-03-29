@@ -1,4 +1,5 @@
 .git
 .omx
+dist
 node_modules
 npm-debug.log

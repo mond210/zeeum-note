@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const fsSync = require("node:fs");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
@@ -9,7 +10,8 @@ const sanitizeHtml = require("sanitize-html");
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 const rootDir = __dirname;
-const publicDir = path.join(rootDir, "public");
+const clientDir = path.join(rootDir, "dist");
+const clientIndexPath = path.join(clientDir, "index.html");
 const dataDir = path.join(rootDir, "data");
 const dataFile = path.join(dataDir, "notes.json");
 
@@ -21,20 +23,23 @@ const markdown = new MarkdownIt({
 
 const welcomeContent = `# Welcome to zeeum-note
 
-이 앱은 간단한 마크다운 노트 에디터입니다.
+이 앱은 Docmost 스타일을 참고한 마크다운 문서 워크스페이스입니다.
 
 ## 할 수 있는 일
 
 - 새 노트 만들기
 - 목록에서 빠르게 검색하기
-- 자동 저장으로 바로 수정하기
-- 오른쪽 미리보기에서 결과 확인하기
+- 자동 저장으로 계속 수정하기
+- 우측 패널에서 미리보기와 문서 정보를 함께 확인하기
 
-> 왼쪽에서 노트를 고르고, 오른쪽에서 편집해 보세요.
+> 왼쪽에서 노트를 고르고 가운데에서 편집해 보세요.
 `;
 
 app.use(express.json({ limit: "1mb" }));
-app.use(express.static(publicDir));
+
+if (fsSync.existsSync(clientIndexPath)) {
+  app.use(express.static(clientDir, { index: false }));
+}
 
 function sortNotes(notes) {
   return [...notes].sort((left, right) => {
@@ -107,7 +112,23 @@ function findNote(notes, noteId) {
 
 function renderMarkdown(markdownText) {
   const rendered = markdown.render(markdownText || "");
-  const allowedTags = [...sanitizeHtml.defaults.allowedTags, "h1", "h2", "img", "table", "thead", "tbody", "tr", "th", "td"];
+  const allowedTags = [
+    ...sanitizeHtml.defaults.allowedTags,
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "img",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td"
+  ];
 
   return sanitizeHtml(rendered, {
     allowedTags,
@@ -218,7 +239,12 @@ app.post("/api/render", (req, res) => {
 });
 
 app.get(/^(?!\/api).*/, (_req, res) => {
-  res.sendFile(path.join(publicDir, "index.html"));
+  if (!fsSync.existsSync(clientIndexPath)) {
+    res.status(503).send("Client build not found. Run `npm run build` or start the Vite dev server.");
+    return;
+  }
+
+  res.sendFile(clientIndexPath);
 });
 
 app.use((error, _req, res, _next) => {

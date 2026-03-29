@@ -1,14 +1,27 @@
 {
   "name": "zeeum-note",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Markdown note manager with Docker Compose",
+  "description": "Svelte markdown workspace with Docker Compose",
   "scripts": {
+    "build": "vite build",
+    "dev": "concurrently -k -n api,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:client": "vite --host 0.0.0.0",
+    "dev:server": "node server.js",
+    "preview": "vite preview --host 0.0.0.0",
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^5.1.0",
     "markdown-it": "^14.1.0",
     "sanitize-html": "^2.17.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@tailwindcss/vite": "^4.2.2",
+    "concurrently": "^9.2.1",
+    "svelte": "^5.55.0",
+    "tailwindcss": "^4.2.2",
+    "vite": "^8.0.3"
   }
 }
