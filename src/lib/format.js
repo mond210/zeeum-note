@@ -1,26 +1,3 @@
-export function normalizeTitle(value) {
-  const normalized = typeof value === "string" ? value.trim() : "";
-  return normalized.slice(0, 120) || "Untitled note";
-}
-
-export function sortNotes(notes) {
-  return [...notes].sort((left, right) => {
-    return new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime();
-  });
-}
-
-export function summarize(text) {
-  return text.replace(/\s+/g, " ").trim().slice(0, 130) || "아직 내용이 없습니다.";
-}
-
-export function countWords(text) {
-  return text.trim().split(/\s+/).filter(Boolean).length;
-}
-
-export function countLines(text) {
-  return text ? text.split("\n").length : 0;
-}
-
 export function formatFullDate(value) {
   if (!value) {
     return "-";
@@ -49,10 +26,46 @@ export function formatRelativeDate(value) {
 
   for (const range of ranges) {
     if (Math.abs(seconds) < range.limit) {
-      const valueForUnit = range.step ? Math.round(seconds / range.step) : seconds;
-      return formatter.format(valueForUnit, range.unit);
+      const amount = range.step ? Math.round(seconds / range.step) : seconds;
+      return formatter.format(amount, range.unit);
     }
   }
 
   return formatFullDate(value);
+}
+
+export function normalizeTitle(value, fallback = "Untitled page") {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized.slice(0, 120) || fallback;
+}
+
+export function countWords(text) {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+export function summarize(text) {
+  return text.replace(/\s+/g, " ").trim().slice(0, 140) || "내용이 아직 없습니다.";
+}
+
+export function sortPages(pages) {
+  return [...pages].sort((left, right) => {
+    if ((left.parentId || "") === (right.parentId || "")) {
+      return left.position - right.position;
+    }
+
+    return (left.parentId || "").localeCompare(right.parentId || "");
+  });
+}
+
+export function colorClass(color) {
+  const classes = {
+    amber: "bg-amber-100 text-amber-700 ring-amber-200",
+    cyan: "bg-cyan-100 text-cyan-700 ring-cyan-200",
+    emerald: "bg-emerald-100 text-emerald-700 ring-emerald-200",
+    orange: "bg-orange-100 text-orange-700 ring-orange-200",
+    rose: "bg-rose-100 text-rose-700 ring-rose-200",
+    violet: "bg-violet-100 text-violet-700 ring-violet-200"
+  };
+
+  return classes[color] || classes.cyan;
 }

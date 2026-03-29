@@ -1,11 +1,28 @@
-async function request(path, options = {}) {
-  const init = { ...options };
+function authToken() {
+  if (typeof window === "undefined") {
+    return "";
+  }
 
-  if (options.body) {
+  return window.localStorage.getItem("zeeum_auth_token") || "";
+}
+
+async function request(path, options = {}) {
+  const token = authToken();
+  const init = {
+    credentials: "include",
+    ...options
+  };
+
+  init.headers = {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(options.headers || {})
+  };
+
+  if (options.body !== undefined) {
     init.body = JSON.stringify(options.body);
     init.headers = {
       "Content-Type": "application/json",
-      ...(options.headers || {})
+      ...init.headers
     };
   }
 
@@ -31,33 +48,125 @@ async function request(path, options = {}) {
   return response.json();
 }
 
-export const notesApi = {
-  create(payload) {
-    return request("/api/notes", {
+export const api = {
+  adminDeleteMember(memberId) {
+    return request(`/api/admin/members/${memberId}`, {
+      method: "DELETE"
+    });
+  },
+  adminListMembers() {
+    return request("/api/admin/members");
+  },
+  adminUpdateMember(memberId, payload) {
+    return request(`/api/admin/members/${memberId}`, {
+      method: "PUT",
+      body: payload
+    });
+  },
+  authLogin(payload) {
+    return request("/api/auth/login", {
       method: "POST",
       body: payload
     });
   },
-  delete(noteId) {
-    return request(`/api/notes/${noteId}`, {
+  authLogout() {
+    return request("/api/auth/logout", {
+      method: "POST"
+    });
+  },
+  authSession() {
+    return request("/api/auth/session");
+  },
+  authSignup(payload) {
+    return request("/api/auth/signup", {
+      method: "POST",
+      body: payload
+    });
+  },
+  bootstrap() {
+    return request("/api/bootstrap");
+  },
+  createGroup(projectId, payload) {
+    return request(`/api/projects/${projectId}/groups`, {
+      method: "POST",
+      body: payload
+    });
+  },
+  createPage(projectId, payload) {
+    return request(`/api/projects/${projectId}/pages`, {
+      method: "POST",
+      body: payload
+    });
+  },
+  createProject(payload) {
+    return request("/api/projects", {
+      method: "POST",
+      body: payload
+    });
+  },
+  deleteGroup(projectId, groupId) {
+    return request(`/api/projects/${projectId}/groups/${groupId}`, {
       method: "DELETE"
     });
   },
-  health() {
-    return request("/api/health");
-  },
-  list() {
-    return request("/api/notes");
-  },
-  render(markdown) {
-    return request("/api/render", {
-      method: "POST",
-      body: { markdown }
+  deletePage(projectId, pageId) {
+    return request(`/api/projects/${projectId}/pages/${pageId}`, {
+      method: "DELETE"
     });
   },
-  update(noteId, payload) {
-    return request(`/api/notes/${noteId}`, {
+  getHealth() {
+    return request("/api/health");
+  },
+  getPage(projectId, pageId) {
+    return request(`/api/projects/${projectId}/pages/${pageId}`);
+  },
+  getPageHistory(projectId, pageId) {
+    return request(`/api/projects/${projectId}/pages/${pageId}/history`);
+  },
+  getProject(projectId) {
+    return request(`/api/projects/${projectId}`);
+  },
+  locatePage(pageId) {
+    return request(`/api/page-locator/${pageId}`);
+  },
+  openProject(projectId) {
+    return request(`/api/projects/${projectId}/open`, {
+      method: "POST"
+    });
+  },
+  updateGroup(projectId, groupId, payload) {
+    return request(`/api/projects/${projectId}/groups/${groupId}`, {
       method: "PUT",
+      body: payload
+    });
+  },
+  updateGroupMembers(projectId, groupId, memberIds) {
+    return request(`/api/projects/${projectId}/groups/${groupId}/members`, {
+      method: "PUT",
+      body: { memberIds }
+    });
+  },
+  updatePage(projectId, pageId, payload) {
+    return request(`/api/projects/${projectId}/pages/${pageId}`, {
+      method: "PUT",
+      body: payload
+    });
+  },
+  updatePreferences(payload) {
+    return request("/api/preferences", {
+      method: "PUT",
+      body: payload
+    });
+  },
+  updateProject(projectId, payload) {
+    return request(`/api/projects/${projectId}`, {
+      method: "PUT",
+      body: payload
+    });
+  },
+  movePage(projectId, pageId, payload) {
+    return request(`/api/projects/${projectId}/pages/${pageId}/move`, {
+      method: "POST",
       body: payload
     });
   }
