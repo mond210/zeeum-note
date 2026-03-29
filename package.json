@@ -1,9 +1,14 @@
 {
   "name": "zeeum-note",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Minimal Node app for Docker Compose",
+  "description": "Markdown note manager with Docker Compose",
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "markdown-it": "^14.1.0",
+    "sanitize-html": "^2.17.0"
   }
 }

@@ -1,2 +1,4 @@
 .omx/
 node_modules/
+data/notes.json
+data/*.tmp
