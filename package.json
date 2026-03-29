@@ -1,0 +1,9 @@
+{
+  "name": "zeeum-note",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Node app for Docker Compose",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
