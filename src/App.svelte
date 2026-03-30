@@ -98,7 +98,7 @@ import PageEditorView from "./components/PageEditorView.svelte";
     />
   {:else if $appStore.activeProject}
     <div class="min-h-screen">
-      <header class="w-full border-b border-slate-200/80 bg-white/88">
+      <header class="sticky top-0 z-20 w-full border-b border-slate-200/80 bg-white/88 backdrop-blur-md">
         <div class="mx-auto flex min-h-[4.5rem] max-w-[1280px] flex-wrap items-center justify-between gap-4 px-6 py-3 sm:px-8 lg:px-12 xl:px-16">
           <div class="flex min-w-0 items-center gap-4">
             <button

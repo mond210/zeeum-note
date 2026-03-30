@@ -59,6 +59,10 @@ const passwordIterations = 120000;
 const sessionSecret = process.env.SESSION_SECRET || "zeeum-dev-session-secret";
 const collabWriteTimers = new Map();
 const connectionUsers = new WeakMap();
+let baseStateCache = null;
+let baseStatePromise = null;
+let revisionsCache = null;
+let revisionsPromise = null;
 
 const ServerVideoBlock = TipTapNode.create({
   addAttributes() {
@@ -590,11 +594,34 @@ async function readJson(file, fallback) {
 }
 
 async function writeJson(file, value) {
-  const tempFile = `${file}.tmp`;
+  const tempFile = `${file}.${crypto.randomUUID()}.tmp`;
   const payload = `${JSON.stringify(value, null, 2)}\n`;
 
   await fs.writeFile(tempFile, payload, "utf8");
   await fs.rename(tempFile, file);
+
+  if (file === files.revisions) {
+    revisionsCache = value;
+    return;
+  }
+
+  if (!baseStateCache) {
+    return;
+  }
+
+  if (file === files.projects) {
+    baseStateCache.projects = value;
+  } else if (file === files.pages) {
+    baseStateCache.pages = value;
+  } else if (file === files.groups) {
+    baseStateCache.groups = value;
+  } else if (file === files.users) {
+    baseStateCache.users = value;
+  } else if (file === files.members) {
+    baseStateCache.members = value;
+  } else if (file === files.preferences) {
+    baseStateCache.preferences = value;
+  }
 }
 
 function byProject(projectId, entries) {
@@ -730,6 +757,24 @@ async function ensureStore() {
     changed = true;
   }
 
+  const sanitizedPages = pages.map((page) => {
+    if (page.contentFormat !== "tiptap-json") {
+      return page;
+    }
+
+    return {
+      ...page,
+      content: normalizeStoredRichDocContent(page.content)
+    };
+  });
+
+  if (JSON.stringify(sanitizedPages) !== JSON.stringify(pages)) {
+    pages = sanitizedPages;
+    changed = true;
+  } else {
+    pages = sanitizedPages;
+  }
+
   if (!Array.isArray(groups) || groups.length === 0) {
     groups = defaultGroups(fallbackProjectId);
     changed = true;
@@ -782,20 +827,105 @@ async function ensureStore() {
   }
 }
 
-async function loadState() {
+function trimRevisions(revisions, { perPage = 20, total = 200 } = {}) {
+  if (!Array.isArray(revisions) || revisions.length <= total) {
+    return Array.isArray(revisions) ? revisions : [];
+  }
+
+  const perPageCounts = new Map();
+  const kept = [];
+
+  for (let index = revisions.length - 1; index >= 0; index -= 1) {
+    const revision = revisions[index];
+    const pageId = revision?.pageId || "unknown";
+    const count = perPageCounts.get(pageId) || 0;
+
+    if (count >= perPage) {
+      continue;
+    }
+
+    kept.push(revision);
+    perPageCounts.set(pageId, count + 1);
+
+    if (kept.length >= total) {
+      break;
+    }
+  }
+
+  return kept.reverse();
+}
+
+async function loadBaseState() {
   await ensureStore();
 
-  const [projects, pages, groups, revisions, users, members, preferences] = await Promise.all([
-    readJson(files.projects, []),
-    readJson(files.pages, []),
-    readJson(files.groups, []),
-    readJson(files.revisions, []),
-    readJson(files.users, []),
-    readJson(files.members, []),
-    readJson(files.preferences, defaultPreferences())
-  ]);
+  if (baseStateCache) {
+    return baseStateCache;
+  }
 
-  return { projects, pages, groups, revisions, users, members, preferences };
+  if (!baseStatePromise) {
+    baseStatePromise = Promise.all([
+      readJson(files.projects, []),
+      readJson(files.pages, []),
+      readJson(files.groups, []),
+      readJson(files.users, []),
+      readJson(files.members, []),
+      readJson(files.preferences, defaultPreferences())
+    ]).then(([projects, pages, groups, users, members, preferences]) => {
+      baseStateCache = { projects, pages, groups, users, members, preferences };
+      baseStatePromise = null;
+      return baseStateCache;
+    });
+  }
+
+  return baseStatePromise;
+}
+
+async function loadRevisionsState() {
+  await ensureStore();
+
+  if (revisionsCache) {
+    return revisionsCache;
+  }
+
+  if (!revisionsPromise) {
+    revisionsPromise = readJson(files.revisions, []).then(async (loaded) => {
+      const normalized = Array.isArray(loaded) ? loaded.map(compactRevision) : [];
+      const trimmed = trimRevisions(normalized);
+      revisionsPromise = null;
+      revisionsCache = trimmed;
+
+      const shouldRewrite =
+        trimmed.length !== normalized.length ||
+        normalized.some((revision, index) => {
+          const original = Array.isArray(loaded) ? loaded[index] : null;
+          return original?.snapshot !== undefined || original?.text !== revision.text;
+        });
+
+      if (shouldRewrite) {
+        await writeJson(files.revisions, trimmed);
+      }
+
+      return revisionsCache;
+    });
+  }
+
+  return revisionsPromise;
+}
+
+async function loadState({ includeRevisions = false } = {}) {
+  const baseState = await loadBaseState();
+
+  if (!includeRevisions) {
+    return {
+      ...baseState,
+      revisions: []
+    };
+  }
+
+  return {
+    ...baseState,
+    revisions: await loadRevisionsState()
+  };
 }
 
 function reindexSiblings(pages, projectId, parentId) {
@@ -827,7 +957,10 @@ function makePage(seed, pages) {
     position,
     icon: typeof seed.icon === "string" ? seed.icon : "file-text",
     contentFormat: seed.contentFormat === "markdown" ? "markdown" : "tiptap-json",
-    content: seed.contentFormat === "markdown" ? seed.content || "" : clone(seed.content || EMPTY_DOC),
+    content:
+      seed.contentFormat === "markdown"
+        ? seed.content || ""
+        : normalizeStoredRichDocContent(clone(seed.content || EMPTY_DOC)),
     createdAt: timestamp,
     updatedAt: timestamp
   };
@@ -884,13 +1017,219 @@ function proseDocFromMarkdown(markdownText) {
   };
 }
 
+function richNodeText(node) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+
+  if (node.type === "text") {
+    return node.text || "";
+  }
+
+  if (node.type === "hardBreak") {
+    return "\n";
+  }
+
+  return Array.isArray(node.content) ? node.content.map(richNodeText).join("") : "";
+}
+
+function stripKnownCorruptionText(text) {
+  return String(text || "")
+    .replace(/\b(?:CHECK|SYNC|RECHECK)_\d+\b/g, "")
+    .replace(/\bMD_(?=\b|$)/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function sanitizeRichNode(node) {
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+
+  if (node.type === "text") {
+    const text = stripKnownCorruptionText(typeof node.text === "string" ? node.text : "");
+    return text.length > 0 ? { ...node, text } : null;
+  }
+
+  if (!Array.isArray(node.content)) {
+    return clone(node);
+  }
+
+  const content = node.content.map((child) => sanitizeRichNode(child)).filter(Boolean);
+  return {
+    ...node,
+    content
+  };
+}
+
+function sanitizeRichDocContent(content) {
+  const sanitized = sanitizeRichNode(content);
+
+  if (!sanitized || sanitized.type !== "doc") {
+    return clone(EMPTY_DOC);
+  }
+
+  if (!Array.isArray(sanitized.content) || sanitized.content.length === 0) {
+    return clone(EMPTY_DOC);
+  }
+
+  return sanitized;
+}
+
+function collapseRepeatedBlockWindows(nodes, maxWindow = 80) {
+  let blocks = Array.isArray(nodes) ? [...nodes] : [];
+
+  for (let size = Math.min(maxWindow, Math.floor(blocks.length / 2)); size >= 2; size -= 1) {
+    const next = [];
+
+    for (let index = 0; index < blocks.length;) {
+      if (index + size * 2 <= blocks.length) {
+        const baseSignature = blocks
+          .slice(index, index + size)
+          .map((node) => JSON.stringify(node))
+          .join("\u0000");
+
+        let repeats = 1;
+
+        while (index + size * (repeats + 1) <= blocks.length) {
+          const candidateSignature = blocks
+            .slice(index + size * repeats, index + size * (repeats + 1))
+            .map((node) => JSON.stringify(node))
+            .join("\u0000");
+
+          if (candidateSignature !== baseSignature) {
+            break;
+          }
+
+          repeats += 1;
+        }
+
+        if (repeats > 1) {
+          next.push(...blocks.slice(index, index + size));
+          index += size * repeats;
+          continue;
+        }
+      }
+
+      next.push(blocks[index]);
+      index += 1;
+    }
+
+    blocks = next;
+  }
+
+  return blocks;
+}
+
+function normalizeStoredRichDocContent(content) {
+  const sanitized = sanitizeRichDocContent(content);
+  const cleanedBlocks = sanitized.content
+    .map((node) => sanitizeRichNode(node))
+    .filter((node) => node && stripKnownCorruptionText(richNodeText(node)).length > 0);
+  const collapsedBlocks = collapseRepeatedBlockWindows(cleanedBlocks);
+
+  return {
+    ...sanitized,
+    content: collapsedBlocks.length > 0 ? collapsedBlocks : clone(EMPTY_DOC.content)
+  };
+}
+
+function markdownFromRichDoc(node, level = 0) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+
+  if (node.type === "doc") {
+    return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("\n\n").trim();
+  }
+
+  if (node.type === "paragraph") {
+    return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("");
+  }
+
+  if (node.type === "text") {
+    let text = node.text || "";
+
+    if (Array.isArray(node.marks)) {
+      for (const mark of node.marks) {
+        if (mark.type === "bold") {
+          text = `**${text}**`;
+        } else if (mark.type === "italic") {
+          text = `*${text}*`;
+        } else if (mark.type === "strike") {
+          text = `~~${text}~~`;
+        } else if (mark.type === "link") {
+          text = `[${text}](${mark.attrs?.href || "#"})`;
+        }
+      }
+    }
+
+    return text;
+  }
+
+  if (node.type === "heading") {
+    const hashes = "#".repeat(node.attrs?.level || 1);
+    return `${hashes} ${(node.content || []).map((child) => markdownFromRichDoc(child, level)).join("")}`;
+  }
+
+  if (node.type === "bulletList") {
+    return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("\n");
+  }
+
+  if (node.type === "orderedList") {
+    return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("\n");
+  }
+
+  if (node.type === "listItem") {
+    const content = (node.content || []).map((child) => markdownFromRichDoc(child, level + 1)).join("\n");
+    return `${"  ".repeat(level)}- ${content}`;
+  }
+
+  if (node.type === "blockquote") {
+    return (node.content || [])
+      .map((child) => markdownFromRichDoc(child, level))
+      .join("\n")
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+  }
+
+  if (node.type === "codeBlock") {
+    return `\`\`\`\n${pageText({ content: node, contentFormat: "tiptap-json" })}\n\`\`\``;
+  }
+
+  if (node.type === "horizontalRule") {
+    return "---";
+  }
+
+  if (node.type === "taskList") {
+    return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("\n");
+  }
+
+  if (node.type === "taskItem") {
+    const checked = node.attrs?.checked ? "x" : " ";
+    const content = (node.content || []).map((child) => markdownFromRichDoc(child, level + 1)).join("");
+    return `${"  ".repeat(level)}- [${checked}] ${content}`;
+  }
+
+  if (node.type === "image") {
+    return `![image](${node.attrs?.src || ""})`;
+  }
+
+  if (node.type === "videoBlock") {
+    return `<video src="${node.attrs?.src || ""}" />`;
+  }
+
+  return (node.content || []).map((child) => markdownFromRichDoc(child, level)).join("");
+}
+
 function collaborationDocJsonFromPage(page) {
   if (!page) {
     return clone(EMPTY_DOC);
   }
 
   if (page.contentFormat === "tiptap-json" && page.content) {
-    return clone(page.content);
+    return normalizeStoredRichDocContent(clone(page.content));
   }
 
   return proseDocFromMarkdown(page.content);
@@ -986,7 +1325,7 @@ async function initializeCollaborationDoc(doc) {
     return doc;
   }
 
-  const state = await loadState();
+  const state = await loadState({ includeRevisions: true });
   const page = state.pages.find(
     (entry) => entry.projectId === room.projectId && entry.id === room.pageId
   );
@@ -998,6 +1337,20 @@ async function initializeCollaborationDoc(doc) {
     );
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(sourceDoc));
     sourceDoc.destroy();
+
+    const markdownText = doc.getText("markdown");
+    const nextMarkdown =
+      page.contentFormat === "markdown"
+        ? String(page.content || "")
+        : markdownFromRichDoc(page.content);
+
+    if (markdownText.length > 0) {
+      markdownText.delete(0, markdownText.length);
+    }
+
+    if (nextMarkdown) {
+      markdownText.insert(0, nextMarkdown);
+    }
   }
 
   doc.initialized = true;
@@ -1031,7 +1384,7 @@ async function writeCollaborationState(doc) {
   }
 
   const previousPage = clone(page);
-  page.content = yDocToProsemirrorJSON(doc);
+  page.content = normalizeStoredRichDocContent(yDocToProsemirrorJSON(doc));
   page.contentFormat = "tiptap-json";
   page.updatedAt = nowIso();
 
@@ -1041,11 +1394,12 @@ async function writeCollaborationState(doc) {
     nextPage: page,
     previousPage
   });
+  const nextRevisions = appendRevision(state.revisions, revision);
 
   await Promise.all([
     writeJson(files.pages, state.pages),
     writeJson(files.projects, nextProjects),
-    writeJson(files.revisions, [...state.revisions, revision])
+    writeJson(files.revisions, nextRevisions)
   ]);
 }
 
@@ -1148,13 +1502,24 @@ function createRevision({ actor, nextPage, previousPage = null }) {
     diff: stats,
     pageId: nextPage.id,
     projectId: nextPage.projectId,
-    snapshot: {
-      content: clone(nextPage.content),
-      contentFormat: nextPage.contentFormat,
-      icon: nextPage.icon,
-      title: nextPage.title
-    },
     text: pageText(nextPage)
+  };
+}
+
+function appendRevision(revisions, revision) {
+  return trimRevisions([...(Array.isArray(revisions) ? revisions : []), revision]);
+}
+
+function compactRevision(revision) {
+  return {
+    id: revision?.id || crypto.randomUUID(),
+    authorId: revision?.authorId || null,
+    authorName: revision?.authorName || "Unknown",
+    createdAt: revision?.createdAt || nowIso(),
+    diff: revision?.diff || { addedChars: 0, removedChars: 0 },
+    pageId: revision?.pageId || null,
+    projectId: revision?.projectId || null,
+    text: typeof revision?.text === "string" ? revision.text : ""
   };
 }
 
@@ -1798,7 +2163,7 @@ app.get("/api/projects/:projectId/pages/:pageId", requireAuth, async (req, res, 
 
 app.get("/api/projects/:projectId/pages/:pageId/history", requireAuth, async (req, res, next) => {
   try {
-    const state = await loadState();
+    const state = await loadState({ includeRevisions: true });
     const page = getPageOr404(state.pages, req.params.projectId, req.params.pageId, res);
 
     if (!page) {
@@ -1817,7 +2182,7 @@ app.get("/api/projects/:projectId/pages/:pageId/history", requireAuth, async (re
 
 app.post("/api/projects/:projectId/pages", requireAuth, async (req, res, next) => {
   try {
-    const state = await loadState();
+    const state = await loadState({ includeRevisions: true });
     const project = getProjectOr404(state.projects, req.params.projectId, res);
 
     if (!project) {
@@ -1843,13 +2208,13 @@ app.post("/api/projects/:projectId/pages", requireAuth, async (req, res, next) =
     );
 
     const nextPages = [...state.pages, page];
-    const nextRevisions = [
-      ...state.revisions,
+    const nextRevisions = appendRevision(
+      state.revisions,
       createRevision({
         actor: req.currentUser,
         nextPage: page
       })
-    ];
+    );
     reindexSiblings(nextPages, project.id, parentId);
 
     const nextProjects = touchProject(state.projects, project.id);
@@ -1876,7 +2241,7 @@ app.post("/api/projects/:projectId/pages", requireAuth, async (req, res, next) =
 
 app.put("/api/projects/:projectId/pages/:pageId", requireAuth, async (req, res, next) => {
   try {
-    const state = await loadState();
+    const state = await loadState({ includeRevisions: true });
     const page = getPageOr404(state.pages, req.params.projectId, req.params.pageId, res);
 
     if (!page) {
@@ -1893,20 +2258,23 @@ app.put("/api/projects/:projectId/pages/:pageId", requireAuth, async (req, res, 
       page.content = typeof req.body?.content === "string" ? req.body.content : page.content;
     } else if (req.body?.contentFormat === "tiptap-json") {
       page.contentFormat = "tiptap-json";
-      page.content = typeof req.body?.content === "object" ? req.body.content : page.content;
+      page.content =
+        typeof req.body?.content === "object"
+          ? normalizeStoredRichDocContent(req.body.content)
+          : page.content;
     }
 
     page.updatedAt = nowIso();
 
     const nextProjects = touchProject(state.projects, page.projectId);
-    const nextRevisions = [
-      ...state.revisions,
+    const nextRevisions = appendRevision(
+      state.revisions,
       createRevision({
         actor: req.currentUser,
         nextPage: page,
         previousPage
       })
-    ];
+    );
 
     await Promise.all([
       writeJson(files.pages, state.pages),
@@ -2237,19 +2605,40 @@ const server = app.listen(port, "0.0.0.0", async () => {
 
       wss.handleUpgrade(req, socket, head, async (ws) => {
         connectionUsers.set(ws, publicUser(user));
-        const doc = await getCollaborationDoc(roomName);
-        doc.conns.set(ws, new Set());
         ws.binaryType = "arraybuffer";
         ws._zeeumPong = true;
 
-        ws.on("message", (message) =>
-          handleCollaborationMessage(ws, doc, new Uint8Array(message))
-        );
-        ws.on("close", () => closeCollaborationConnection(doc, ws));
-        ws.on("error", () => closeCollaborationConnection(doc, ws));
+        const earlyMessages = [];
+        let doc = null;
+
+        ws.on("message", (message) => {
+          if (!doc) {
+            earlyMessages.push(message);
+            return;
+          }
+
+          handleCollaborationMessage(ws, doc, new Uint8Array(message));
+        });
+        ws.on("close", () => {
+          if (doc) {
+            closeCollaborationConnection(doc, ws);
+          }
+        });
+        ws.on("error", () => {
+          if (doc) {
+            closeCollaborationConnection(doc, ws);
+          }
+        });
         ws.on("pong", () => {
           ws._zeeumPong = true;
         });
+
+        doc = await getCollaborationDoc(roomName);
+        doc.conns.set(ws, new Set());
+
+        for (const message of earlyMessages) {
+          handleCollaborationMessage(ws, doc, new Uint8Array(message));
+        }
 
         const pingInterval = setInterval(() => {
           if (ws.readyState !== 1) {
@@ -2296,4 +2685,7 @@ const server = app.listen(port, "0.0.0.0", async () => {
   });
 
   console.log(`Server listening on port ${port}`);
+  void loadBaseState().catch((error) => {
+    console.error("Failed to warm base state cache", error);
+  });
 });

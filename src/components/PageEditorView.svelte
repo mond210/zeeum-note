@@ -20,7 +20,6 @@
   let historyOpen = false;
   let iconPickerOpen = false;
   let settingsMenuOpen = false;
-  let viewMode = "styled";
   let revisions = [];
 
   const iconOptions = [
@@ -39,9 +38,7 @@
   ];
 
   $: breadcrumbs = selectedPage ? breadcrumbTrail(pages, selectedPage.id) : [];
-  $: rawMarkdown = pageDraft?.contentFormat === "markdown"
-    ? pageDraft.content
-    : markdownFromDoc(pageDraft?.content);
+  $: editorInstanceKey = `${selectedPage?.id || ""}:${pageDraft?.contentFormat || ""}`;
 
   function iconGlyph(value) {
     const map = {
@@ -78,6 +75,7 @@
     dispatch("draft", { icon });
     iconPickerOpen = false;
   }
+
 </script>
 
 <section>
@@ -153,7 +151,7 @@
                   class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-slate-700 transition hover:bg-slate-100"
                   on:click={() => {
                     closeOverlays();
-                    const blob = new Blob([rawMarkdown || ""], { type: "text/markdown;charset=utf-8" });
+                    const blob = new Blob([markdownFromDoc(pageDraft?.content) || ""], { type: "text/markdown;charset=utf-8" });
                     const url = URL.createObjectURL(blob);
                     const anchor = document.createElement("a");
                     anchor.href = url;
@@ -210,41 +208,16 @@
             Loading page content...
           </div>
         {:else}
-          <div class="mb-4 flex items-center gap-2">
-            <button
-              type="button"
-              class={`rounded-full px-3 py-2 text-sm font-semibold transition ${
-                viewMode === "styled" ? "bg-slate-950 text-white" : "bg-slate-100 text-slate-600"
-              }`}
-              on:click={() => (viewMode = "styled")}
-            >
-              Styled
-            </button>
-            <button
-              type="button"
-              class={`rounded-full px-3 py-2 text-sm font-semibold transition ${
-                viewMode === "markdown" ? "bg-slate-950 text-white" : "bg-slate-100 text-slate-600"
-              }`}
-              on:click={() => (viewMode = "markdown")}
-            >
-              Markdown
-            </button>
-          </div>
-
-          {#if viewMode === "styled"}
-            {#key selectedPage.id}
-              <RichTextEditor
-                content={pageDraft.content}
-                contentFormat={pageDraft.contentFormat}
-                currentUser={currentUser}
-                documentId={selectedPage.id}
-                projectId={project?.id}
-                on:change={(event) => dispatch("draft", event.detail)}
-              />
-            {/key}
-          {:else}
-            <pre class="overflow-x-auto rounded-2xl bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-100"><code>{rawMarkdown}</code></pre>
-          {/if}
+          {#key editorInstanceKey}
+            <RichTextEditor
+              content={pageDraft.content}
+              contentFormat={pageDraft.contentFormat}
+              currentUser={currentUser}
+              documentId={selectedPage.id}
+              projectId={project?.id}
+              on:change={(event) => dispatch("draft", event.detail)}
+            />
+          {/key}
         {/if}
       </div>
     {:else}

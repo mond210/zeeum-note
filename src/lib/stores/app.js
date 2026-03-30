@@ -135,6 +135,28 @@ function createAppStore() {
     }
   }
 
+  async function bootstrapWithToken(token) {
+    const response = await fetch("/api/bootstrap", {
+      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    if (!response.ok) {
+      let message = "부트스트랩 요청에 실패했습니다.";
+
+      try {
+        const payload = await response.json();
+        message = payload.error || message;
+      } catch {}
+
+      throw new Error(message);
+    }
+
+    return response.json();
+  }
+
   function draftSignature(draft) {
     return JSON.stringify({
       content: draft.content,
@@ -179,6 +201,40 @@ function createAppStore() {
         ? sortRecentProjects(payload.recentProjects)
         : state.recentProjects
     }));
+  }
+
+  async function applyAuthenticatedBootstrap(payload) {
+    set({
+      ...initialState,
+      authenticated: true,
+      booting: true,
+      currentUser: payload.currentUser,
+      memberDirectory: payload.memberDirectory || [],
+      members: payload.members,
+      preferences: payload.preferences,
+      projects: sortProjects(payload.projects),
+      recentProjects: sortRecentProjects(payload.recentProjects),
+      status: { message: "Projects loaded", tone: "success" }
+    });
+
+    await resolveInitialRoute(payload);
+  }
+
+  function applyAuthenticatedLauncher(payload) {
+    set({
+      ...initialState,
+      authenticated: true,
+      booting: false,
+      currentUser: payload.currentUser,
+      memberDirectory: payload.memberDirectory || [],
+      members: payload.members,
+      preferences: payload.preferences,
+      projects: sortProjects(payload.projects),
+      recentProjects: sortRecentProjects(payload.recentProjects),
+      route: "launcher",
+      status: { message: "Signed in", tone: "success" }
+    });
+    history.replaceState({}, "", "/");
   }
 
   function mergeProject(project) {
@@ -467,20 +523,7 @@ function createAppStore() {
         return;
       }
 
-      set({
-        ...initialState,
-        authenticated: true,
-        booting: true,
-        currentUser: payload.currentUser,
-        memberDirectory: payload.memberDirectory || [],
-        members: payload.members,
-        preferences: payload.preferences,
-        projects: sortProjects(payload.projects),
-        recentProjects: sortRecentProjects(payload.recentProjects),
-        status: { message: "Projects loaded", tone: "success" }
-      });
-
-      await resolveInitialRoute(payload);
+      await applyAuthenticatedBootstrap(payload);
     } catch (error) {
       set({
         ...initialState,
@@ -551,10 +594,17 @@ function createAppStore() {
     setStatus("Saving page...", "pending");
 
     try {
-      const payload = await api.updatePage(state.activeProjectId, state.selectedPageId, {
+      const requestBody = {
         icon: state.pageDraft.icon,
         title: normalizeTitle(state.pageDraft.title, "Untitled page")
-      });
+      };
+
+      if (state.pageDraft.contentFormat === "markdown") {
+        requestBody.content = state.pageDraft.content;
+        requestBody.contentFormat = "markdown";
+      }
+
+      const payload = await api.updatePage(state.activeProjectId, state.selectedPageId, requestBody);
 
       await refreshProjectContext();
 
@@ -783,13 +833,8 @@ function createAppStore() {
     try {
       const result = await api.authLogin(credentials);
       storeAuthToken(result.sessionToken);
-      update((state) => ({
-        ...state,
-        authenticated: true,
-        currentUser: result.currentUser
-      }));
-      await bootstrap();
-      setStatus("Signed in", "success");
+      const payload = await bootstrapWithToken(result.sessionToken);
+      applyAuthenticatedLauncher(payload);
       return true;
     } catch (error) {
       setStatus(error.message, "error");
@@ -803,13 +848,8 @@ function createAppStore() {
     try {
       const result = await api.authSignup(payload);
       storeAuthToken(result.sessionToken);
-      update((state) => ({
-        ...state,
-        authenticated: true,
-        currentUser: result.currentUser
-      }));
-      await bootstrap();
-      setStatus("Account created", "success");
+      const nextPayload = await bootstrapWithToken(result.sessionToken);
+      applyAuthenticatedLauncher(nextPayload);
       return true;
     } catch (error) {
       setStatus(error.message, "error");

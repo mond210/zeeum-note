@@ -27,9 +27,11 @@
 
   let editor;
   let element;
+  let collabReady = false;
+  let collabReadyTimer = null;
+  let collaborationEnabled = false;
   let lastAppliedSignature = "";
   let lastEmittedSignature = "";
-  let collaborationEnabled = false;
   let mediaDialog = null;
   let mediaMenu = null;
   let provider;
@@ -350,8 +352,10 @@
   }
 
   onMount(() => {
-    if (documentId && projectId && currentUser) {
-      collaborationEnabled = true;
+    collaborationEnabled = Boolean(documentId && projectId && currentUser);
+    collabReady = false;
+
+    if (collaborationEnabled) {
       ydoc = new Y.Doc();
       provider = new WebsocketProvider(
         `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/api/collab`,
@@ -364,10 +368,21 @@
           }
         }
       );
+      collabReadyTimer = setTimeout(() => {
+        collabReady = true;
+      }, 2500);
+
+      provider.on("sync", () => {
+        if (collabReadyTimer) {
+          clearTimeout(collabReadyTimer);
+          collabReadyTimer = null;
+        }
+        collabReady = true;
+      });
     }
 
     editor = new Editor({
-      content: provider ? undefined : resolvedContent(contentFormat, content),
+      content: resolvedContent(contentFormat, content),
       editorProps: {
         attributes: {
           class:
@@ -404,6 +419,7 @@
           heading: {
             levels: [1, 2, 3]
           },
+          link: false,
           undoRedo: !collaborationEnabled
         }),
         Link.configure({
@@ -447,15 +463,19 @@
           : [])
       ],
       onUpdate() {
-        emitChange();
+        if (!collaborationEnabled) {
+          emitChange();
+        }
       }
     });
 
     lastAppliedSignature = signatureFor(contentFormat, content);
-    return () => editor?.destroy();
   });
 
   onDestroy(() => {
+    if (collabReadyTimer) {
+      clearTimeout(collabReadyTimer);
+    }
     provider?.destroy();
     ydoc?.destroy();
     editor?.destroy();
@@ -543,7 +563,7 @@
 </script>
 
 <div class="relative pb-24">
-  <div bind:this={element}></div>
+  <div bind:this={element} data-collab-ready={collabReady ? "true" : "false"}></div>
 
   {#if uploading}
     <div class="pointer-events-none absolute right-0 top-0 rounded-full bg-slate-950 px-3 py-1.5 text-xs font-semibold text-white">

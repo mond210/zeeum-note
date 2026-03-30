@@ -7,7 +7,7 @@ function authToken() {
 }
 
 async function request(path, options = {}) {
-  const token = authToken();
+  const token = options.tokenOverride ?? (options.withoutAuth ? "" : authToken());
   const init = {
     credentials: "include",
     ...options
@@ -66,6 +66,7 @@ export const api = {
   authLogin(payload) {
     return request("/api/auth/login", {
       method: "POST",
+      withoutAuth: true,
       body: payload
     });
   },
@@ -80,11 +81,14 @@ export const api = {
   authSignup(payload) {
     return request("/api/auth/signup", {
       method: "POST",
+      withoutAuth: true,
       body: payload
     });
   },
-  bootstrap() {
-    return request("/api/bootstrap");
+  bootstrap(tokenOverride) {
+    return request("/api/bootstrap", {
+      tokenOverride
+    });
   },
   createGroup(projectId, payload) {
     return request(`/api/projects/${projectId}/groups`, {

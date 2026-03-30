@@ -1,5 +1,5 @@
 .omx/
 dist/
 node_modules/
-data/notes.json
+data/*.json
 data/*.tmp
