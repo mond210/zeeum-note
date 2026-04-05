@@ -2450,7 +2450,7 @@ function buildOpenAiCodexAuthorizeUrl({ callbackUrl, state, challenge }) {
   url.searchParams.set("state", state);
   url.searchParams.set("id_token_add_organizations", "true");
   url.searchParams.set("codex_cli_simplified_flow", "true");
-  url.searchParams.set("originator", "zeeum-note");
+  url.searchParams.set("originator", "pi");
 
   return url.toString();
 }
@@ -2458,13 +2458,13 @@ function buildOpenAiCodexAuthorizeUrl({ callbackUrl, state, challenge }) {
 async function requestOpenAiCodexTokens({ code, codeVerifier, redirectUri, grantType = "authorization_code", refreshToken = "" }) {
   const body = new URLSearchParams({
     client_id: OPENAI_CODEX_CLIENT_ID,
-    grant_type: grantType,
-    redirect_uri: redirectUri
+    grant_type: grantType
   });
 
   if (grantType === "authorization_code") {
     body.set("code", code);
     body.set("code_verifier", codeVerifier);
+    body.set("redirect_uri", redirectUri);
   } else {
     body.set("refresh_token", refreshToken);
   }
@@ -2517,6 +2517,243 @@ async function requestOpenAiCodexTokens({ code, codeVerifier, redirectUri, grant
   } finally {
     clearTimeout(timer);
   }
+}
+
+function resolveOpenAiCodexUrl(baseUrl) {
+  const raw = String(baseUrl || "").trim() || OPENAI_CODEX_BASE_URL;
+  const normalized = raw.replace(/\/+$/, "");
+
+  if (normalized.endsWith("/codex/responses")) {
+    return normalized;
+  }
+
+  if (normalized.endsWith("/codex")) {
+    return `${normalized}/responses`;
+  }
+
+  return `${normalized}/codex/responses`;
+}
+
+function buildOpenAiCodexUserAgent() {
+  return `pi (${process.platform} ${process.arch})`;
+}
+
+function buildOpenAiCodexHeaders({ accessToken, accountId }) {
+  return {
+    accept: "text/event-stream",
+    Authorization: `Bearer ${accessToken}`,
+    "chatgpt-account-id": accountId,
+    "content-type": "application/json",
+    "OpenAI-Beta": "responses=experimental",
+    originator: "pi",
+    "User-Agent": buildOpenAiCodexUserAgent()
+  };
+}
+
+async function parseOpenAiCodexErrorResponse(response) {
+  const raw = await response.text().catch(() => "");
+  let message = raw || response.statusText || "OpenAI Codex request failed";
+
+  try {
+    const parsed = JSON.parse(raw);
+    const err = parsed?.error;
+
+    if (err) {
+      const code = err.code || err.type || "";
+
+      if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
+        const plan = err.plan_type ? ` (${String(err.plan_type).toLowerCase()} plan)` : "";
+        message = `You have hit your ChatGPT usage limit${plan}.`;
+      } else {
+        message = err.message || message;
+      }
+    }
+  } catch {}
+
+  return message;
+}
+
+async function* parseOpenAiCodexSseEvents(response) {
+  if (!response.body) {
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      let boundaryIndex = buffer.indexOf("\n\n");
+
+      while (boundaryIndex !== -1) {
+        const chunk = buffer.slice(0, boundaryIndex);
+        buffer = buffer.slice(boundaryIndex + 2);
+        const dataLines = chunk
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim());
+
+        if (dataLines.length > 0) {
+          const data = dataLines.join("\n").trim();
+
+          if (data && data !== "[DONE]") {
+            try {
+              yield JSON.parse(data);
+            } catch {}
+          }
+        }
+
+        boundaryIndex = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+}
+
+async function maybeRefreshOpenAiCodexCredentials(state) {
+  const stored = getOpenAiCodexStoredOAuth(state);
+
+  if (!stored?.connected) {
+    throw httpError("OpenAI Codex OAuth 연결이 필요합니다.");
+  }
+
+  if (stored.expiresAt && stored.expiresAt > nowMs() + 30_000) {
+    return stored;
+  }
+
+  if (!stored.refresh) {
+    throw httpError("OpenAI Codex OAuth refresh token 이 없습니다. 다시 로그인하세요.");
+  }
+
+  const refreshed = await requestOpenAiCodexTokens({
+    grantType: "refresh_token",
+    redirectUri: OPENAI_CODEX_CALLBACK_PUBLIC_URL,
+    refreshToken: stored.refresh
+  });
+
+  await persistOpenAiCodexOAuthCredentials(refreshed);
+
+  return {
+    access: refreshed.access,
+    accountId: openAiCodexAccountIdFromAccessToken(refreshed.access) || "",
+    connected: true,
+    expiresAt: refreshed.expiresAt,
+    refresh: refreshed.refresh
+  };
+}
+
+async function generateOpenAiCodexText(runtimeConfig, prompt, state) {
+  const stored = await maybeRefreshOpenAiCodexCredentials(state);
+  const accountId = stored.accountId || openAiCodexAccountIdFromAccessToken(stored.access);
+
+  if (!accountId) {
+    throw httpError("OpenAI Codex access token 에서 accountId 를 읽지 못했습니다. 다시 로그인하세요.", 502);
+  }
+
+  const body = {
+    include: ["reasoning.encrypted_content"],
+    input: [
+      {
+        content: [
+          {
+            text: prompt.user,
+            type: "input_text"
+          }
+        ],
+        role: "user"
+      }
+    ],
+    instructions: prompt.system,
+    model: runtimeConfig.model,
+    parallel_tool_calls: true,
+    store: false,
+    stream: true,
+    text: {
+      verbosity: "medium"
+    },
+    tool_choice: "auto"
+  };
+
+  const response = await fetch(resolveOpenAiCodexUrl(runtimeConfig.baseUrl), {
+    body: JSON.stringify(body),
+    headers: buildOpenAiCodexHeaders({
+      accessToken: stored.access,
+      accountId
+    }),
+    method: "POST"
+  });
+
+  if (!response.ok) {
+    const message = await parseOpenAiCodexErrorResponse(response);
+    throw httpError(`OpenAI Codex 요청에 실패했습니다. ${message}`, response.status === 429 ? 429 : 502);
+  }
+
+  let text = "";
+
+  for await (const event of parseOpenAiCodexSseEvents(response)) {
+    const type = typeof event?.type === "string" ? event.type : "";
+
+    if (type === "error") {
+      const code = event.code || "";
+      const message = event.message || "";
+      throw httpError(`OpenAI Codex error: ${message || code || JSON.stringify(event)}`, 502);
+    }
+
+    if (type === "response.failed") {
+      const message = event.response?.error?.message || "OpenAI Codex response failed";
+      throw httpError(message, 502);
+    }
+
+    if (type === "response.output_text.delta" || type === "response.refusal.delta") {
+      text += event.delta || "";
+      continue;
+    }
+
+    if (type === "response.output_item.done" && !text) {
+      const item = event.item;
+
+      if (item?.type === "message" && Array.isArray(item.content)) {
+        text = item.content
+          .map((entry) => {
+            if (entry?.type === "output_text") {
+              return entry.text || "";
+            }
+
+            if (entry?.type === "refusal") {
+              return entry.refusal || "";
+            }
+
+            return "";
+          })
+          .join("");
+      }
+    }
+
+    if (type === "response.completed" || type === "response.done" || type === "response.incomplete") {
+      break;
+    }
+  }
+
+  if (!text.trim()) {
+    throw httpError("OpenAI Codex 응답에서 텍스트를 추출하지 못했습니다.", 502);
+  }
+
+  return text.trim();
 }
 
 function getOpenAiCodexStoredOAuth(state) {
@@ -2984,13 +3221,7 @@ async function generateTextForProfile(state, profileId, prompt) {
   runtimeConfig.model = profile.model;
 
   if (runtimeConfig.providerId === OPENAI_CODEX_PROVIDER_ID) {
-    const stored = getOpenAiCodexStoredOAuth(state);
-
-    if (!stored?.connected) {
-      throw httpError("OpenAI Codex OAuth 연결이 필요합니다.");
-    }
-
-    throw httpError("OpenAI Codex runtime generation은 아직 지원하지 않습니다.", 501);
+    return generateOpenAiCodexText(runtimeConfig, prompt, state);
   }
 
   ensureProviderAccess(runtimeConfig);
