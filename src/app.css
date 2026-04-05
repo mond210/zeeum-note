@@ -225,7 +225,15 @@ textarea {
 }
 
 .tiptap-surface > * + * {
-  margin-top: 0.85rem;
+  margin-top: 1rem;
+}
+
+.tiptap-surface > :is(h1, h2, h3):not(:first-child) {
+  margin-top: 1.9rem;
+}
+
+.tiptap-surface > :is(h1, h2, h3) + :is(p, ul, ol, blockquote, pre, hr) {
+  margin-top: 1.15rem;
 }
 
 .tiptap-surface h1,
