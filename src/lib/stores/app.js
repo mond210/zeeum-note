@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
 import { api } from "../api.js";
 import { normalizeTitle } from "../format.js";
+import { buildPageTree, isDescendant } from "../page-tree.js";
 import { EMPTY_DOC } from "../rich-doc.js";
 
 const emptyDraft = () => ({
@@ -10,9 +11,45 @@ const emptyDraft = () => ({
   title: ""
 });
 
+const emptyAdminConsole = () => ({
+  files: {
+    storeFiles: [],
+    uploads: []
+  },
+  members: [],
+  overview: {
+    backend: {
+      engine: "filesystem",
+      label: "JSON file store",
+      location: "data/*.json + data/uploads",
+      status: "connected"
+    },
+    recentUploads: [],
+    storage: {
+      dataBytes: 0,
+      totalBytes: 0,
+      uploadBytes: 0,
+      uploadTypeTotals: { file: 0, image: 0, video: 0 }
+    },
+    totals: {
+      admins: 0,
+      files: 0,
+      groups: 0,
+      members: 0,
+      pages: 0,
+      projects: 0,
+      revisions: 0
+    }
+  },
+  projects: []
+});
+
 const initialState = {
   activeProject: null,
   activeProjectId: null,
+  adminConsole: emptyAdminConsole(),
+  adminLoading: false,
+  adminSection: "dashboard",
   authenticated: false,
   booting: true,
   currentUser: null,
@@ -40,6 +77,15 @@ function parseLocation(pathname) {
 
   if (normalizedPath === "/") {
     return { route: "launcher" };
+  }
+
+  if (normalizedPath === "/admin" || normalizedPath.startsWith("/admin/")) {
+    const section = normalizedPath.split("/").filter(Boolean)[1] || "dashboard";
+    const allowed = ["dashboard", "projects", "files", "members"];
+    return {
+      route: "admin",
+      section: allowed.includes(section) ? section : "dashboard"
+    };
   }
 
   if (normalizedPath.startsWith("/projects/")) {
@@ -80,7 +126,11 @@ function parseLocation(pathname) {
   return { route: "launcher" };
 }
 
-function routePath(route, projectId = null, pageId = null) {
+function routePath(route, projectId = null, pageId = null, section = null) {
+  if (route === "admin") {
+    return !section || section === "dashboard" ? "/admin" : `/admin/${section}`;
+  }
+
   if (route === "project-home" && projectId) {
     return `/projects/${projectId}`;
   }
@@ -115,6 +165,30 @@ function upsertProject(list, project) {
     : [...list, project];
 
   return next;
+}
+
+function rootSelection(pageIds, pages) {
+  const selected = Array.from(new Set(pageIds));
+
+  return selected.filter((pageId) => {
+    return !selected.some((candidate) => candidate !== pageId && isDescendant(pages, candidate, pageId));
+  });
+}
+
+function orderedRootSelection(pageIds, pages) {
+  const roots = rootSelection(pageIds, pages);
+  const order = new Map(buildPageTree(pages).map((page, index) => [page.id, index]));
+
+  return [...roots].sort((left, right) => (order.get(left) ?? 0) - (order.get(right) ?? 0));
+}
+
+function reindexLocalSiblings(pages, projectId, parentId) {
+  pages
+    .filter((page) => page.projectId === projectId && (page.parentId ?? null) === (parentId ?? null))
+    .sort((left, right) => left.position - right.position)
+    .forEach((page, index) => {
+      page.position = index;
+    });
 }
 
 function createAppStore() {
@@ -262,6 +336,17 @@ function createAppStore() {
   async function refreshLauncherData() {
     const payload = await api.bootstrap();
     applyLauncherData(payload);
+    return payload;
+  }
+
+  async function refreshAdminConsole() {
+    const payload = await api.adminConsole();
+    update((state) => ({
+      ...state,
+      adminConsole: payload,
+      adminLoading: false,
+      memberDirectory: payload.members
+    }));
     return payload;
   }
 
@@ -422,9 +507,22 @@ function createAppStore() {
   }
 
   async function openLauncher({ replace = false } = {}) {
-    if (!snapshot().authenticated) {
+    const state = snapshot();
+
+    if (!state.authenticated) {
       update((state) => ({ ...state, route: "landing" }));
       history[replace ? "replaceState" : "pushState"]({}, "", "/");
+      return;
+    }
+
+    const preferredProject = state.recentProjects[0]?.id || state.projects[0]?.id || null;
+
+    if (preferredProject) {
+      await enterProject(preferredProject, {
+        replace,
+        route: "page",
+        markOpened: false
+      });
       return;
     }
 
@@ -434,6 +532,9 @@ function createAppStore() {
       ...state,
       activeProject: null,
       activeProjectId: null,
+      adminConsole: emptyAdminConsole(),
+      adminLoading: false,
+      adminSection: "dashboard",
       groups: [],
       pages: [],
       route: "launcher",
@@ -441,7 +542,53 @@ function createAppStore() {
     }));
 
     history[replace ? "replaceState" : "pushState"]({}, "", "/");
-    setStatus("Project launcher ready", "success");
+    setStatus("Workspace home ready", "success");
+  }
+
+  async function openAdminConsole(section = "dashboard", { replace = false } = {}) {
+    const state = snapshot();
+
+    if (!state.authenticated) {
+      return;
+    }
+
+    if (state.currentUser?.role !== "admin") {
+      await openLauncher({ replace });
+      setStatus("관리자 권한이 필요합니다.", "error");
+      return;
+    }
+
+    await maybeSaveDirtyPage("admin");
+    update((current) => ({
+      ...current,
+      adminLoading: true,
+      adminSection: section,
+      route: "admin"
+    }));
+
+    try {
+      const [launcherPayload, consolePayload] = await Promise.all([api.bootstrap(), api.adminConsole()]);
+      applyLauncherData(launcherPayload);
+
+      update((current) => ({
+        ...current,
+        adminConsole: consolePayload,
+        adminLoading: false,
+        adminSection: section,
+        currentUser: launcherPayload.currentUser ?? current.currentUser,
+        memberDirectory: consolePayload.members,
+        route: "admin"
+      }));
+
+      history[replace ? "replaceState" : "pushState"]({}, "", routePath("admin", null, null, section));
+      setStatus("Admin console ready", "success");
+    } catch (error) {
+      update((current) => ({
+        ...current,
+        adminLoading: false
+      }));
+      setStatus(error.message, "error");
+    }
   }
 
   function preferredProjectId(payload) {
@@ -453,8 +600,14 @@ function createAppStore() {
     const fallbackProjectId = preferredProjectId(payload);
 
     if (location.route === "launcher") {
-      update((state) => ({ ...state, booting: false, route: "launcher" }));
-      history.replaceState({}, "", "/");
+      update((state) => ({ ...state, booting: false }));
+      await openLauncher({ replace: true });
+      return;
+    }
+
+    if (location.route === "admin") {
+      update((state) => ({ ...state, booting: false }));
+      await openAdminConsole(location.section, { replace: true });
       return;
     }
 
@@ -495,7 +648,7 @@ function createAppStore() {
     const legacyRoute =
       location.route === "legacy-groups" || location.route === "legacy-preferences"
         ? "settings"
-        : "project-home";
+        : "page";
 
     await enterProject(fallbackProjectId, {
       replace: true,
@@ -542,6 +695,11 @@ function createAppStore() {
 
     if (route === "launcher") {
       await openLauncher(options);
+      return;
+    }
+
+    if (route === "admin") {
+      await openAdminConsole(options.section || snapshot().adminSection, options);
       return;
     }
 
@@ -654,6 +812,42 @@ function createAppStore() {
     });
   }
 
+  async function createPageRecord({
+    parentId = null,
+    title = "New page",
+    icon = "file-text",
+    content = EMPTY_DOC,
+    contentFormat = "tiptap-json",
+    selectAfter = true
+  } = {}) {
+    const state = snapshot();
+
+    if (!state.activeProjectId) {
+      return null;
+    }
+
+    const payload = await api.createPage(state.activeProjectId, {
+      content,
+      contentFormat,
+      icon,
+      parentId,
+      title
+    });
+
+    await refreshProjectContext();
+
+    if (selectAfter) {
+      await enterProject(state.activeProjectId, {
+        pageId: payload.page.id,
+        replace: true,
+        route: "page",
+        markOpened: false
+      });
+    }
+
+    return payload.page;
+  }
+
   async function createPage(parentId = null) {
     const state = snapshot();
 
@@ -665,22 +859,37 @@ function createAppStore() {
     setStatus("Creating page...", "pending");
 
     try {
-      const payload = await api.createPage(state.activeProjectId, {
-        content: EMPTY_DOC,
-        contentFormat: "tiptap-json",
+      const page = await createPageRecord({
         parentId,
-        title: parentId ? "New child page" : "New page"
-      });
-
-      await refreshProjectContext();
-      await enterProject(state.activeProjectId, {
-        pageId: payload.page.id,
-        replace: true,
-        route: "page",
-        markOpened: false
+        title: "New page"
       });
       setStatus("Page created", "success");
-      return payload.page;
+      return page;
+    } catch (error) {
+      setStatus(error.message, "error");
+      return null;
+    }
+  }
+
+  async function createFolder(parentId = null) {
+    const state = snapshot();
+
+    if (!state.activeProjectId) {
+      return null;
+    }
+
+    await maybeSaveDirtyPage("page", state.activeProjectId);
+    setStatus("Creating folder...", "pending");
+
+    try {
+      const page = await createPageRecord({
+        icon: "folder_open",
+        parentId,
+        selectAfter: false,
+        title: "New folder"
+      });
+      setStatus("Folder created", "success");
+      return page;
     } catch (error) {
       setStatus(error.message, "error");
       return null;
@@ -718,16 +927,211 @@ function createAppStore() {
     setStatus("Page deleted", "success");
   }
 
-  async function movePage(pageId, parentId) {
+  async function renamePage(pageId, title) {
     const state = snapshot();
 
     if (!state.activeProjectId) {
+      return null;
+    }
+
+    const result = await api.updatePage(state.activeProjectId, pageId, {
+      title
+    });
+
+    await refreshProjectContext();
+
+    if (state.selectedPageId === pageId) {
+      update((current) => ({
+        ...current,
+        pageDraft: {
+          ...current.pageDraft,
+          title: result.page.title
+        },
+        selectedPage:
+          current.selectedPageId === pageId
+            ? {
+                ...current.selectedPage,
+                title: result.page.title
+              }
+            : current.selectedPage
+      }));
+    }
+
+    setStatus("Page renamed", "success");
+    return result.page;
+  }
+
+  async function movePages(pageIds, parentId = null, position = null) {
+    const state = snapshot();
+
+    if (!state.activeProjectId || !Array.isArray(pageIds) || pageIds.length === 0) {
       return;
     }
 
-    await api.movePage(state.activeProjectId, pageId, { parentId, position: 999 });
-    await refreshProjectContext();
-    setStatus("Page moved", "success");
+    const roots = orderedRootSelection(pageIds, state.pages);
+
+    if (roots.length === 0) {
+      return;
+    }
+
+    setStatus("Moving pages...", "pending");
+
+    try {
+      const workingPages = state.pages.map((page) => ({ ...page }));
+      let nextPosition = Number.isFinite(position) ? position : null;
+
+      for (const pageId of roots) {
+        const page = workingPages.find((entry) => entry.id === pageId);
+
+        if (!page) {
+          continue;
+        }
+
+        const nextParentId = parentId ?? null;
+        const currentParentId = page.parentId ?? null;
+        const siblings = workingPages
+          .filter(
+            (entry) =>
+              entry.id !== page.id &&
+              entry.projectId === page.projectId &&
+              (entry.parentId ?? null) === nextParentId
+          )
+          .sort((left, right) => left.position - right.position);
+        const normalizedPosition =
+          nextPosition === null ? siblings.length : Math.max(0, Math.min(nextPosition, siblings.length));
+
+        await api.movePage(state.activeProjectId, pageId, {
+          parentId: nextParentId,
+          position: normalizedPosition
+        });
+
+        page.parentId = nextParentId;
+        page.position = normalizedPosition;
+        reindexLocalSiblings(workingPages, page.projectId, currentParentId);
+        reindexLocalSiblings(workingPages, page.projectId, nextParentId);
+        nextPosition = nextPosition === null ? null : normalizedPosition + 1;
+      }
+
+      await refreshProjectContext();
+      setStatus("Pages moved", "success");
+    } catch (error) {
+      setStatus(error.message, "error");
+    }
+  }
+
+  async function duplicatePages(pageIds) {
+    const state = snapshot();
+
+    if (!state.activeProjectId || !Array.isArray(pageIds) || pageIds.length === 0) {
+      return [];
+    }
+
+    const roots = orderedRootSelection(pageIds, state.pages);
+
+    if (roots.length === 0) {
+      return [];
+    }
+
+    setStatus("Copying pages...", "pending");
+
+    const pagesById = new Map(state.pages.map((page) => [page.id, page]));
+
+    async function duplicateTree(sourceId, targetParentId = null, titleOverride = null) {
+      const source = pagesById.get(sourceId);
+
+      if (!source) {
+        return null;
+      }
+
+      const detail = await api.getPage(state.activeProjectId, source.id);
+      const created = await createPageRecord({
+        content: detail.page.content,
+        contentFormat: detail.page.contentFormat,
+        icon: detail.page.icon,
+        parentId: targetParentId,
+        selectAfter: false,
+        title: titleOverride || source.title
+      });
+
+      const children = state.pages
+        .filter((page) => page.parentId === source.id)
+        .sort((left, right) => left.position - right.position);
+
+      for (const child of children) {
+        await duplicateTree(child.id, created.id, child.title);
+      }
+
+      return created;
+    }
+
+    try {
+      const duplicates = [];
+
+      for (const sourceId of roots) {
+        const source = pagesById.get(sourceId);
+        const duplicated = await duplicateTree(
+          sourceId,
+          source?.parentId ?? null,
+          `${source?.title || "Untitled"} copy`
+        );
+
+        if (duplicated) {
+          duplicates.push(duplicated);
+        }
+      }
+
+      await refreshProjectContext();
+      setStatus("Pages copied", "success");
+      return duplicates;
+    } catch (error) {
+      setStatus(error.message, "error");
+      return [];
+    }
+  }
+
+  async function deletePages(pageIds) {
+    const state = snapshot();
+
+    if (!state.activeProjectId || !Array.isArray(pageIds) || pageIds.length === 0) {
+      return;
+    }
+
+    const roots = orderedRootSelection(pageIds, state.pages);
+
+    if (roots.length === 0) {
+      return;
+    }
+
+    setStatus("Deleting pages...", "pending");
+
+    try {
+      for (const pageId of roots) {
+        await api.deletePage(state.activeProjectId, pageId);
+      }
+
+      const payload = await refreshProjectContext();
+      const nextPageId = payload?.project.homePageId || payload?.pages[0]?.id || null;
+
+      if (nextPageId) {
+        await enterProject(state.activeProjectId, {
+          pageId: nextPageId,
+          replace: true,
+          route: "page",
+          markOpened: false
+        });
+      } else {
+        clearPageSelection();
+        update((current) => ({
+          ...current,
+          route: "project-home"
+        }));
+        history.replaceState({}, "", routePath("project-home", state.activeProjectId));
+      }
+
+      setStatus("Pages deleted", "success");
+    } catch (error) {
+      setStatus(error.message, "error");
+    }
   }
 
   async function createProject(payload) {
@@ -742,7 +1146,7 @@ function createAppStore() {
       await refreshLauncherData();
       await enterProject(result.project.id, {
         replace: false,
-        route: "project-home",
+        route: "page",
         markOpened: false
       });
       setStatus("Project created", "success");
@@ -835,6 +1239,7 @@ function createAppStore() {
       storeAuthToken(result.sessionToken);
       const payload = await bootstrapWithToken(result.sessionToken);
       applyAuthenticatedLauncher(payload);
+      await openLauncher({ replace: true });
       return true;
     } catch (error) {
       setStatus(error.message, "error");
@@ -850,6 +1255,7 @@ function createAppStore() {
       storeAuthToken(result.sessionToken);
       const nextPayload = await bootstrapWithToken(result.sessionToken);
       applyAuthenticatedLauncher(nextPayload);
+      await openLauncher({ replace: true });
       return true;
     } catch (error) {
       setStatus(error.message, "error");
@@ -876,20 +1282,43 @@ function createAppStore() {
       ...state,
       memberDirectory: result.members
     }));
-    await refreshLauncherData();
+    await Promise.all([refreshLauncherData(), refreshAdminConsole()]);
     setStatus("Member updated", "success");
     return result.member;
   }
 
   async function deleteMember(memberId) {
     await api.adminDeleteMember(memberId);
-    const result = await api.adminListMembers();
-    update((state) => ({
-      ...state,
-      memberDirectory: result.members
-    }));
-    await refreshLauncherData();
+    await Promise.all([refreshLauncherData(), refreshAdminConsole()]);
     setStatus("Member removed", "success");
+  }
+
+  async function deleteProjectAsAdmin(projectId) {
+    await api.adminDeleteProject(projectId);
+
+    update((state) => {
+      if (state.activeProjectId !== projectId) {
+        return state;
+      }
+
+      return {
+        ...state,
+        activeProject: null,
+        activeProjectId: null,
+        groups: [],
+        pages: []
+      };
+    });
+
+    clearPageSelection();
+    await Promise.all([refreshLauncherData(), refreshAdminConsole()]);
+    setStatus("Project removed", "success");
+  }
+
+  async function deleteUpload(filename) {
+    await api.adminDeleteUpload(filename);
+    await refreshAdminConsole();
+    setStatus("File removed", "success");
   }
 
   window.addEventListener("popstate", async () => {
@@ -897,6 +1326,11 @@ function createAppStore() {
 
     if (location.route === "launcher") {
       await openLauncher({ replace: true });
+      return;
+    }
+
+    if (location.route === "admin") {
+      await openAdminConsole(location.section, { replace: true });
       return;
     }
 
@@ -930,7 +1364,7 @@ function createAppStore() {
       } catch {
         await enterProject(fallbackProjectId, {
           replace: true,
-          route: "project-home"
+          route: "page"
         });
         return;
       }
@@ -941,7 +1375,7 @@ function createAppStore() {
       route:
         location.route === "legacy-groups" || location.route === "legacy-preferences"
           ? "settings"
-          : "project-home"
+          : "page"
     });
   });
 
@@ -949,15 +1383,23 @@ function createAppStore() {
     bootstrap,
     createGroup,
     createPage,
+    createFolder,
     createProject,
+    deleteProjectAsAdmin,
+    deleteUpload,
     deleteGroup,
     deletePage,
+    deletePages,
     deleteMember,
+    duplicatePages,
     enterProject,
     login,
+    movePages,
     navigate,
+    openAdminConsole,
     openLauncher,
     logout,
+    renamePage,
     saveGroup,
     saveGroupMembers,
     savePage,
@@ -968,8 +1410,7 @@ function createAppStore() {
     signup,
     subscribe,
     updateMember,
-    updatePageDraft,
-    movePage
+    updatePageDraft
   };
 }
 
