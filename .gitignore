@@ -1,4 +1,5 @@
 .omx/
+.codex/history.md
 dist/
 node_modules/
 data/*.json

@@ -4,7 +4,6 @@
 
 export let groups = [];
 export let currentUser = null;
-export let memberDirectory = [];
 export let members = [];
 export let pages = [];
 export let preferences = null;
@@ -97,20 +96,6 @@ export let project = null;
       description: "Describe the purpose of this group.",
       memberIds: ["member-owner"],
       name: "New group"
-    });
-  }
-
-  function handleRoleChange(member, role) {
-    dispatch("updateMember", {
-      memberId: member.id,
-      payload: { role }
-    });
-  }
-
-  function handleLoginToggle(member) {
-    dispatch("updateMember", {
-      memberId: member.id,
-      payload: { canLogin: !member.canLogin }
     });
   }
 </script>
@@ -403,62 +388,60 @@ export let project = null;
               Workspace members
             </h2>
             <p class="mt-3 max-w-2xl text-sm leading-7 text-slate-500">
-              Accounts created from signup and seeded users are managed here. This is the base for future collaborative editing permissions.
+              프로젝트 설정에서는 멤버 현황만 요약하고, 실제 역할 변경과 계정 관리는 전용 관리자 페이지에서 처리합니다.
             </p>
           </div>
         </div>
 
-        {#if currentUser?.role === "admin"}
-          <div class="mt-8 divide-y divide-slate-200">
-            {#each memberDirectory as member}
-              <div class="flex flex-col gap-4 py-4 lg:flex-row lg:items-center lg:justify-between">
-                <div class="min-w-0">
-                  <p class="truncate text-base font-semibold text-slate-950">{member.name}</p>
-                  <p class="mt-1 text-sm text-slate-500">{member.email}</p>
-                  <p class="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
-                    {member.role} · {member.canLogin ? "login enabled" : "login disabled"}
-                  </p>
-                </div>
-
-                <div class="flex flex-wrap items-center gap-2">
-                  <select
-                    class="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500"
-                    value={member.role}
-                    on:change={(event) => handleRoleChange(member, event.currentTarget.value)}
-                  >
-                    <option value="member">member</option>
-                    <option value="admin">admin</option>
-                  </select>
-
-                  <button
-                    type="button"
-                    class="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-sky-300 hover:text-sky-700"
-                    on:click={() => handleLoginToggle(member)}
-                  >
-                    {member.canLogin ? "Disable login" : "Enable login"}
-                  </button>
-
-                  {#if currentUser.id !== member.id}
-                    <button
-                      type="button"
-                      class="rounded-full border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-semibold text-rose-700 transition hover:-translate-y-0.5"
-                      on:click={() => dispatch("deleteMember", member.id)}
-                    >
-                      Remove
-                    </button>
-                  {/if}
-                </div>
+        <div class="mt-8 grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+          <div class="rounded-[1.5rem] border border-slate-200/80 bg-white px-5 py-5 shadow-[0_14px_36px_rgba(15,23,42,0.05)]">
+            <div class="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <p class="text-sm font-semibold text-slate-950">현재 멤버</p>
+                <p class="mt-2 text-sm leading-6 text-slate-500">
+                  전체 워크스페이스 계정을 전용 관리자 페이지에서 관리할 수 있습니다.
+                </p>
               </div>
-            {/each}
+
+              {#if currentUser?.role === "admin"}
+                <button
+                  type="button"
+                  class="rounded-full bg-sky-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-800"
+                  on:click={() => dispatch("openAdminConsole")}
+                >
+                  관리자 페이지 열기
+                </button>
+              {/if}
+            </div>
+
+            <div class="mt-6 divide-y divide-slate-200">
+              {#each members as member}
+                <div class="flex items-center justify-between gap-3 py-3">
+                  <div class="min-w-0">
+                    <p class="truncate text-sm font-semibold text-slate-950">{member.name}</p>
+                    <p class="truncate text-xs text-slate-500">{member.email}</p>
+                  </div>
+                  <span class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-600">
+                    {member.role}
+                  </span>
+                </div>
+              {/each}
+            </div>
           </div>
-        {:else}
-          <div class="mt-8 border border-dashed border-slate-300 bg-slate-50 px-6 py-8 text-center">
-            <p class="text-lg font-semibold text-slate-950">Admin access required</p>
-            <p class="mt-2 text-sm leading-6 text-slate-500">
-              Only admin accounts can change member roles or remove members.
-            </p>
+
+          <div class="rounded-[1.5rem] border border-slate-200/80 bg-slate-50 px-5 py-5">
+            <p class="text-sm font-semibold text-slate-950">관리자 전용 기능</p>
+            <ul class="mt-4 space-y-3 text-sm leading-6 text-slate-500">
+              <li>Role 변경</li>
+              <li>로그인 허용 및 차단</li>
+              <li>이름 수정과 비밀번호 재설정</li>
+              <li>회원 탈퇴 처리</li>
+            </ul>
+            {#if currentUser?.role !== "admin"}
+              <p class="mt-4 text-xs leading-5 text-slate-400">현재 계정은 읽기 전용으로 멤버 현황만 볼 수 있습니다.</p>
+            {/if}
           </div>
-        {/if}
+        </div>
       </section>
     {/if}
   </div>

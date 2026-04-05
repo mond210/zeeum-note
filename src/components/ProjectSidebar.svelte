@@ -1,10 +1,16 @@
 <script>
+  import AccountMenu from "./AccountMenu.svelte";
   import { tick } from "svelte";
   import { createEventDispatcher } from "svelte";
   import { buildPageTree, isDescendant } from "../lib/page-tree.js";
+  import { scrollbarActivity } from "../lib/scrollbar-activity.js";
+  import SidebarAiDialog from "./SidebarAiDialog.svelte";
 
+  export let currentUser = null;
+  export let docked = true;
   export let pages = [];
   export let searchQuery = "";
+  export let showAdminLink = false;
   export let selectedPageId = null;
 
   const dispatch = createEventDispatcher();
@@ -19,6 +25,7 @@
   let dropInstruction = null;
   let lastSelectedId = null;
   let pointerDrag = null;
+  let aiDialogOpen = false;
   let renamingId = null;
   let renameValue = "";
   let searchInput;
@@ -99,7 +106,7 @@
     });
   }
 
-  function buildRows(parentId = null, depth = 0) {
+  function buildRows(parentId = null, depth = 0, collapsed = collapsedIds) {
     return pages
       .filter((page) => (page.parentId ?? null) === parentId)
       .sort((left, right) => left.position - right.position)
@@ -111,11 +118,11 @@
           isFolder: rowIsFolder(page)
         };
 
-        if (!row.hasChildren || collapsedIds.has(page.id)) {
+        if (!row.hasChildren || collapsed.has(page.id)) {
           return [row];
         }
 
-        return [row, ...buildRows(page.id, depth + 1)];
+        return [row, ...buildRows(page.id, depth + 1, collapsed)];
       });
   }
 
@@ -526,7 +533,7 @@
   }));
   $: rows = query
     ? allRows.filter((page) => `${page.title} ${page.excerpt || ""}`.toLowerCase().includes(query))
-    : buildRows();
+    : buildRows(null, 0, collapsedIds);
   $: selectedCount = selectedIds.length;
   $: activeContextPage = contextMenu
     ? (() => {
@@ -560,103 +567,98 @@
   on:pointercancel={finishPointerDrag}
 />
 
-<aside class="flex min-h-0 flex-col border-r border-slate-200/80 pr-4">
-  <div class="border-b border-slate-200/80 px-2 pb-4">
-    <div class="flex items-center justify-between gap-3">
-      <div>
-        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Workspace</p>
-        <p class="mt-1 text-sm font-semibold text-slate-950">Files</p>
-      </div>
+<aside class={`flex h-full min-h-0 flex-col ${docked ? "border-r border-slate-200/80" : ""}`}>
+  <div class="border-b border-slate-200/80 px-2 py-2.5">
+    <div class="scroll-thin flex min-h-8 items-center gap-1.5 overflow-x-auto">
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+          aria-label="Search"
+          title="Search"
+          on:click={toggleSearch}
+        >
+          <span class="material-symbols-rounded text-[18px]">{searchOpen ? "search_off" : "search"}</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-sky-700"
+          aria-label="AI organize"
+          title="AI organize"
+          on:click={() => {
+            aiDialogOpen = true;
+            closeContextMenu();
+          }}
+        >
+          <span class="material-symbols-rounded text-[18px]">auto_awesome</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+          aria-label="New page"
+          title="New page"
+          on:click={() => createPageAt(selectedFolderId)}
+        >
+          <span class="material-symbols-rounded text-[18px]">note_add</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+          aria-label="New folder"
+          title="New folder"
+          on:click={() => createFolderAt(selectedFolderId)}
+        >
+          <span class="material-symbols-rounded text-[18px]">create_new_folder</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="Rename"
+          title="Rename"
+          disabled={selectedCount !== 1}
+          on:click={() => {
+            const page = pages.find((entry) => entry.id === selectedIds[0]);
 
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-        aria-label="Hide file manager"
-        title="Hide file manager"
-        on:click={() => dispatch("toggleSidebar")}
-      >
-        <span class="material-symbols-rounded">left_panel_close</span>
-      </button>
-    </div>
-
-    <div class="mt-4 flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-        aria-label="Search"
-        title="Search"
-        on:click={toggleSearch}
-      >
-        <span class="material-symbols-rounded text-[18px]">{searchOpen ? "search_off" : "search"}</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-        aria-label="New page"
-        title="New page"
-        on:click={() => createPageAt(selectedFolderId)}
-      >
-        <span class="material-symbols-rounded text-[18px]">note_add</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-        aria-label="New folder"
-        title="New folder"
-        on:click={() => createFolderAt(selectedFolderId)}
-      >
-        <span class="material-symbols-rounded text-[18px]">create_new_folder</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="Rename"
-        title="Rename"
-        disabled={selectedCount !== 1}
-        on:click={() => {
-          const page = pages.find((entry) => entry.id === selectedIds[0]);
-
-          if (page) {
-            startRename(page);
-          }
-        }}
-      >
-        <span class="material-symbols-rounded text-[18px]">drive_file_rename_outline</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="Move"
-        title="Move"
-        disabled={selectedCount === 0}
-        on:click={openMoveDialog}
-      >
-        <span class="material-symbols-rounded text-[18px]">drive_file_move</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="Copy"
-        title="Copy"
-        disabled={selectedCount === 0}
-        on:click={duplicateSelected}
-      >
-        <span class="material-symbols-rounded text-[18px]">content_copy</span>
-      </button>
-      <button
-        type="button"
-        class="grid h-9 w-9 place-items-center text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="Delete"
-        title="Delete"
-        disabled={selectedCount === 0}
-        on:click={deleteSelected}
-      >
-        <span class="material-symbols-rounded text-[18px]">delete</span>
-      </button>
+            if (page) {
+              startRename(page);
+            }
+          }}
+        >
+          <span class="material-symbols-rounded text-[18px]">drive_file_rename_outline</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="Move"
+          title="Move"
+          disabled={selectedCount === 0}
+          on:click={openMoveDialog}
+        >
+          <span class="material-symbols-rounded text-[18px]">drive_file_move</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="Copy"
+          title="Copy"
+          disabled={selectedCount === 0}
+          on:click={duplicateSelected}
+        >
+          <span class="material-symbols-rounded text-[18px]">content_copy</span>
+        </button>
+        <button
+          type="button"
+          class="grid h-8 w-8 shrink-0 place-items-center rounded-xl text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="Delete"
+          title="Delete"
+          disabled={selectedCount === 0}
+          on:click={deleteSelected}
+        >
+          <span class="material-symbols-rounded text-[18px]">delete</span>
+        </button>
     </div>
 
     {#if searchOpen}
-      <div class="mt-4">
+      <div class="mt-2">
         <input
           bind:this={searchInput}
           class="w-full border border-slate-200 bg-transparent px-3 py-2.5 text-sm text-slate-700 outline-none transition focus:border-sky-500"
@@ -668,7 +670,7 @@
     {/if}
   </div>
 
-  <div class="scroll-thin flex-1 overflow-y-auto px-0 py-2">
+  <div class="scroll-thin flex-1 overflow-y-auto px-0 py-2" use:scrollbarActivity>
     {#if draggedIds.length > 0}
       <div
         class={`mx-2 mb-2 rounded-xl border border-dashed px-3 py-2 text-xs font-medium transition ${
@@ -788,6 +790,18 @@
       </div>
     {/if}
   </div>
+
+  <div class="shrink-0 border-t border-slate-200/80">
+    <AccountMenu
+      align="left"
+      currentUser={currentUser}
+      menuDirection="up"
+      showAdminLink={showAdminLink}
+      triggerMode="sidebar"
+      on:logout={() => dispatch("logout")}
+      on:openAdmin={() => dispatch("openAdmin")}
+    />
+  </div>
 </aside>
 
 {#if contextMenu && activeContextPage}
@@ -897,4 +911,14 @@
       {/if}
     </div>
   </div>
+{/if}
+
+{#if aiDialogOpen}
+  <SidebarAiDialog
+    pages={pages}
+    projectId={pages[0]?.projectId || null}
+    selectedPageIds={currentSelectedRoots()}
+    on:applied={() => dispatch("aiApplied")}
+    on:close={() => (aiDialogOpen = false)}
+  />
 {/if}

@@ -1,13 +1,14 @@
-FROM node:25.8.2-alpine3.23 AS build
+FROM node:22-alpine AS build
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 
-RUN npm ci
+RUN npm ci --no-audit --no-fund
 
 COPY server.js ./
 COPY index.html ./
+COPY public ./public
 COPY svelte.config.mjs ./
 COPY vite.config.mjs ./
 COPY src ./src
@@ -16,7 +17,7 @@ COPY data ./data
 RUN npm run build
 RUN npm prune --omit=dev
 
-FROM node:25.8.2-alpine3.23
+FROM node:22-alpine
 
 WORKDIR /app
 
@@ -30,5 +31,6 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/data ./data
 
 EXPOSE 3000
+EXPOSE 1455
 
 CMD ["npm", "start"]

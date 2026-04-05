@@ -1,8 +1,10 @@
 <script>
+  import AccountMenu from "./AccountMenu.svelte";
   import { createEventDispatcher } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { formatRelativeDate } from "../lib/format.js";
 
+  export let currentUser = null;
   export let projects = [];
   export let recentProjects = [];
 
@@ -48,15 +50,19 @@
 <div class="min-h-screen">
   <section class="w-full border-b border-slate-200/80 bg-white/88">
     <div class="mx-auto flex min-h-[4.25rem] max-w-[1040px] items-center justify-between px-6 sm:px-10 lg:px-14">
-      <div class="flex items-center gap-3">
-        <div class="grid h-9 w-9 place-items-center rounded-xl bg-slate-900 text-xs font-semibold text-white">
-          ZE
-        </div>
+        <div class="flex items-center gap-3">
+          <AccountMenu
+            currentUser={currentUser}
+            showAdminLink={currentUser?.role === "admin"}
+            on:logout={() => dispatch("logout")}
+          on:openAdmin={() => dispatch("openAdminConsole")}
+        />
         <div>
           <p class="text-sm font-semibold text-slate-950">zeeum-note</p>
-          <p class="text-xs text-slate-400">Projects</p>
+          <p class="text-xs text-slate-400">Workspace</p>
         </div>
       </div>
+      <p class="hidden text-sm text-slate-400 sm:block">페이지를 바로 열 수 있는 워크스페이스 홈입니다.</p>
     </div>
   </section>
 
@@ -65,14 +71,14 @@
       <div>
         <div class="flex items-center justify-between gap-3">
           <div>
-            <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Accessible projects</p>
-            <p class="mt-2 text-sm text-slate-500">{projects.length} available right now</p>
+            <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Available workspace</p>
+            <p class="mt-2 text-sm text-slate-500">{projects.length} workspace entries available right now</p>
           </div>
           <button
             type="button"
             class="grid h-10 w-10 place-items-center rounded-full border border-slate-200 bg-white text-slate-600 transition hover:border-sky-300 hover:text-sky-700"
-            aria-label="Create project"
-            title="Create project"
+            aria-label="Create workspace"
+            title="Create workspace"
             on:click={openCreateDialog}
           >
             <span class="material-symbols-rounded">add</span>
@@ -120,7 +126,7 @@
 
     <section class="section-rule mt-8 px-1 pt-8 sm:px-0">
       <div>
-        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Recently opened</p>
+        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Recently opened workspace</p>
       </div>
 
       {#if recentProjects.length > 0}
@@ -169,7 +175,7 @@
               {draftIcon}
             </div>
             <div>
-              <p class="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700">New project</p>
+              <p class="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700">New workspace</p>
               <h2 class="mt-2 text-[1.9rem] font-semibold tracking-[-0.06em] text-slate-950">
                 Create a clean workspace
               </h2>
@@ -190,11 +196,11 @@
 
         <div class="mt-7 grid gap-4 sm:grid-cols-[minmax(0,1fr)_110px]">
           <label class="block">
-            <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Project name</span>
+            <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Workspace name</span>
             <input
               class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
               bind:value={name}
-              placeholder="Product planning"
+              placeholder="Team notes"
             />
           </label>
 
@@ -220,7 +226,7 @@
 
         <div class="mt-6 flex items-center justify-between gap-4 border-t border-slate-200 pt-5">
           <p class="text-xs leading-5 text-slate-400">
-            The project is created with starter pages and opens immediately.
+            The workspace is created with starter pages and opens immediately.
           </p>
 
           <div class="flex justify-end gap-2">
@@ -237,7 +243,7 @@
               disabled={!name.trim()}
               on:click={handleSubmit}
             >
-              Create project
+              Create workspace
             </button>
           </div>
         </div>

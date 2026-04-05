@@ -48,9 +48,81 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+async function upload(path, formData) {
+  const token = authToken();
+  const response = await fetch(path, {
+    body: formData,
+    credentials: "include",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    method: "POST"
+  });
+
+  if (!response.ok) {
+    let message = "요청에 실패했습니다.";
+
+    try {
+      const payload = await response.json();
+      message = payload.error || message;
+    } catch {
+      message = response.statusText || message;
+    }
+
+    throw new Error(message);
+  }
+
+  return response.json();
+}
+
 export const api = {
+  adminAiSettings() {
+    return request("/api/admin/ai/settings");
+  },
+  adminAiProviderOauthDisconnect(providerId) {
+    return request(`/api/admin/ai/providers/${providerId}/oauth/disconnect`, {
+      method: "POST"
+    });
+  },
+  adminAiProviderOauthStart(providerId) {
+    return request(`/api/admin/ai/providers/${providerId}/oauth/start`, {
+      method: "POST"
+    });
+  },
+  adminAiProviderOauthStatus(providerId) {
+    return request(`/api/admin/ai/providers/${providerId}/oauth/status`);
+  },
+  adminListAiModels(providerId, payload) {
+    return request(`/api/admin/ai/providers/${providerId}/models`, {
+      body: payload,
+      method: "POST"
+    });
+  },
+  adminSaveAiSettings(payload) {
+    return request("/api/admin/ai/settings", {
+      body: payload,
+      method: "PUT"
+    });
+  },
+  adminTestAiProvider(providerId, payload) {
+    return request(`/api/admin/ai/providers/${providerId}/test`, {
+      body: payload,
+      method: "POST"
+    });
+  },
+  adminConsole() {
+    return request("/api/admin/console");
+  },
   adminDeleteMember(memberId) {
     return request(`/api/admin/members/${memberId}`, {
+      method: "DELETE"
+    });
+  },
+  adminDeleteProject(projectId) {
+    return request(`/api/admin/projects/${projectId}`, {
+      method: "DELETE"
+    });
+  },
+  adminDeleteUpload(filename) {
+    return request(`/api/admin/files/${encodeURIComponent(filename)}`, {
       method: "DELETE"
     });
   },
@@ -75,15 +147,53 @@ export const api = {
       method: "POST"
     });
   },
-  authSession() {
-    return request("/api/auth/session");
-  },
   authSignup(payload) {
     return request("/api/auth/signup", {
       method: "POST",
       withoutAuth: true,
       body: payload
     });
+  },
+  aiEditorApply(previewId) {
+    return request("/api/ai/editor/apply", {
+      body: { previewId },
+      method: "POST"
+    });
+  },
+  aiEditorPreview(payload) {
+    return request("/api/ai/editor/preview", {
+      body: payload,
+      method: "POST"
+    });
+  },
+  aiEditorSummary(payload) {
+    return request("/api/ai/editor/summary", {
+      body: payload,
+      method: "POST"
+    });
+  },
+  aiInsertTranscript(payload) {
+    return request("/api/ai/editor/insert-transcript", {
+      body: payload,
+      method: "POST"
+    });
+  },
+  aiNavigationApply(previewId) {
+    return request("/api/ai/navigation/apply", {
+      body: { previewId },
+      method: "POST"
+    });
+  },
+  aiNavigationPreview(payload) {
+    return request("/api/ai/navigation/preview", {
+      body: payload,
+      method: "POST"
+    });
+  },
+  aiTranscribeAudio(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return upload("/api/ai/stt/transcribe", formData);
   },
   bootstrap(tokenOverride) {
     return request("/api/bootstrap", {
@@ -118,9 +228,6 @@ export const api = {
       method: "DELETE"
     });
   },
-  getHealth() {
-    return request("/api/health");
-  },
   getPage(projectId, pageId) {
     return request(`/api/projects/${projectId}/pages/${pageId}`);
   },
@@ -132,6 +239,12 @@ export const api = {
   },
   locatePage(pageId) {
     return request(`/api/page-locator/${pageId}`);
+  },
+  movePage(projectId, pageId, payload) {
+    return request(`/api/projects/${projectId}/pages/${pageId}/move`, {
+      method: "POST",
+      body: payload
+    });
   },
   openProject(projectId) {
     return request(`/api/projects/${projectId}/open`, {
@@ -165,12 +278,6 @@ export const api = {
   updateProject(projectId, payload) {
     return request(`/api/projects/${projectId}`, {
       method: "PUT",
-      body: payload
-    });
-  },
-  movePage(projectId, pageId, payload) {
-    return request(`/api/projects/${projectId}/pages/${pageId}/move`, {
-      method: "POST",
       body: payload
     });
   }

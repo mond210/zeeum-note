@@ -5,19 +5,50 @@
 
   const dispatch = createEventDispatcher();
 
-  let loginEmail = "admin@zeeum.local";
-  let loginPassword = "admin1234!";
   let signupEmail = "";
   let signupName = "";
   let signupPassword = "";
+  let loginEmail = "";
+  let loginPassword = "";
   let mode = "login";
+
+  $: canLogin = loginEmail.trim() && loginPassword.trim();
+  $: canSignup = signupName.trim() && signupEmail.trim() && signupPassword.trim();
+  $: statusClass =
+    status?.tone === "error"
+      ? "text-rose-700"
+      : status?.tone === "success"
+        ? "text-emerald-700"
+        : status?.tone === "pending"
+          ? "text-sky-700"
+          : "text-slate-500";
+
+  function submitLogin() {
+    if (!canLogin) {
+      return;
+    }
+
+    dispatch("login", { email: loginEmail, password: loginPassword });
+  }
+
+  function submitSignup() {
+    if (!canSignup) {
+      return;
+    }
+
+    dispatch("signup", {
+      email: signupEmail,
+      name: signupName,
+      password: signupPassword
+    });
+  }
 </script>
 
-<div class="min-h-screen">
-  <header class="w-full border-b border-slate-200/80 bg-white">
-    <div class="mx-auto flex min-h-[4.5rem] max-w-[1180px] items-center justify-between px-6 sm:px-8 lg:px-12">
+<div class="min-h-screen bg-white">
+  <main class="mx-auto grid max-w-[1280px] gap-12 px-6 py-12 sm:px-8 lg:grid-cols-[minmax(0,1fr)_420px] lg:px-12 lg:py-16">
+    <section class="min-w-0">
       <div class="flex items-center gap-3">
-        <div class="grid h-9 w-9 place-items-center rounded-xl bg-slate-900 text-xs font-semibold text-white">
+        <div class="grid h-9 w-9 place-items-center bg-slate-950 text-xs font-semibold text-white">
           ZE
         </div>
         <div>
@@ -25,76 +56,90 @@
           <p class="text-xs text-slate-400">Collaborative workspace</p>
         </div>
       </div>
-    </div>
-  </header>
 
-  <div class="mx-auto grid max-w-[1180px] gap-14 px-6 py-12 sm:px-8 lg:grid-cols-[1.15fr_0.85fr] lg:px-12 lg:py-16">
-    <section>
-      <p class="text-[0.72rem] font-semibold uppercase tracking-[0.28em] text-sky-700">Landing</p>
-      <h1 class="mt-5 text-[clamp(2.8rem,6vw,5rem)] font-semibold tracking-[-0.08em] text-slate-950">
-        Project knowledge, now with accounts.
+      <p class="mt-8 text-[0.72rem] font-semibold uppercase tracking-[0.28em] text-sky-700">Collaborative notes</p>
+      <h1 class="mt-5 max-w-4xl text-[clamp(2.8rem,6vw,5rem)] font-semibold tracking-[-0.08em] text-slate-950">
+        여러 사람이 함께 쓰는 노트를 더 단정하게 이어갑니다.
       </h1>
-      <p class="mt-5 max-w-2xl text-base leading-8 text-slate-500">
-        This workspace now supports sign-in, sign-up, member management, and a seeded admin account so future collaborative editing has a real identity layer to build on.
+      <p class="mt-5 max-w-3xl text-base leading-8 text-slate-500 sm:text-[1.05rem]">
+        페이지를 빠르게 열고, 수정하고, 공유할 수 있는 작업 공간입니다. 문서 구조는 왼쪽에서 정리하고,
+        편집은 중앙에서 바로 이어갈 수 있도록 화면을 단순하게 유지했습니다.
       </p>
 
-      <div class="mt-10 grid gap-6 sm:grid-cols-3">
+      <div class="mt-10 grid gap-6 border-t border-slate-200/80 pt-6 sm:grid-cols-3">
         <div>
-          <p class="text-sm font-semibold text-slate-950">Default admin</p>
+          <p class="text-sm font-semibold text-slate-950">실시간 편집</p>
           <p class="mt-2 text-sm leading-6 text-slate-500">
-            `admin@zeeum.local` / `admin1234!`
+            여러 사람이 같은 페이지를 열어도 흐름이 끊기지 않게 편집 상태를 유지합니다.
           </p>
         </div>
         <div>
-          <p class="text-sm font-semibold text-slate-950">Membership</p>
+          <p class="text-sm font-semibold text-slate-950">파일 중심 탐색</p>
           <p class="mt-2 text-sm leading-6 text-slate-500">
-            Admins can manage workspace members from Project settings.
+            페이지와 폴더를 트리로 정리하고 필요한 문서를 바로 찾아 들어갈 수 있습니다.
           </p>
         </div>
         <div>
-          <p class="text-sm font-semibold text-slate-950">Next step</p>
+          <p class="text-sm font-semibold text-slate-950">히스토리 복기</p>
           <p class="mt-2 text-sm leading-6 text-slate-500">
-            This is the base needed for collaborative editing later.
+            최근 변경 이력을 확인하면서 문서 맥락을 다시 따라갈 수 있습니다.
           </p>
         </div>
       </div>
+
+      <div class="mt-10 border-t border-slate-200/80 pt-6">
+        <p class="text-sm font-semibold text-slate-950">현재 워크플로우</p>
+        <p class="mt-3 max-w-3xl text-sm leading-7 text-slate-500">
+          로그인하면 바로 마지막 작업 흐름으로 들어가고, 페이지 에디터 안에서 파일 트리와 탭을 오가며 문서를 수정할 수 있습니다.
+          화면 장식보다 탐색과 편집 속도를 우선하는 방향으로 맞췄습니다.
+        </p>
+      </div>
     </section>
 
-    <aside class="dialog-surface rounded-[1.4rem] border border-slate-200/90 px-6 py-6 sm:px-7">
-      <div class="flex items-center gap-2 rounded-full bg-slate-100 p-1">
+    <aside class="border-t border-slate-200/80 pt-8 lg:border-t-0 lg:border-l lg:pl-10 lg:pt-0">
+      <div>
+        <p class="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-sky-700">Workspace access</p>
+        <h2 class="mt-3 text-[2rem] font-semibold tracking-[-0.06em] text-slate-950">
+          {mode === "login" ? "작업을 이어서 시작하세요" : "새 계정을 만드세요"}
+        </h2>
+        <p class="mt-3 text-sm leading-7 text-slate-500">
+          {mode === "login"
+            ? "계정으로 로그인하면 마지막 작업 페이지로 바로 이동합니다."
+            : "새 계정을 만든 뒤 바로 워크스페이스에서 페이지 작업을 시작할 수 있습니다."}
+        </p>
+      </div>
+
+      <div class="mt-6 flex items-center gap-2 border-b border-slate-200 pb-3">
         <button
           type="button"
-          class={`flex-1 rounded-full px-4 py-2 text-sm font-semibold transition ${
-            mode === "login" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500"
+          class={`px-0 py-2 text-sm font-semibold transition ${
+            mode === "login" ? "text-slate-950" : "text-slate-400"
           }`}
           on:click={() => (mode = "login")}
         >
-          Sign in
+          로그인
         </button>
+        <span class="text-slate-300">/</span>
         <button
           type="button"
-          class={`flex-1 rounded-full px-4 py-2 text-sm font-semibold transition ${
-            mode === "signup" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500"
+          class={`px-0 py-2 text-sm font-semibold transition ${
+            mode === "signup" ? "text-slate-950" : "text-slate-400"
           }`}
           on:click={() => (mode = "signup")}
         >
-          Sign up
+          회원가입
         </button>
       </div>
 
       {#if mode === "login"}
-        <div class="mt-6 space-y-4">
-          <div>
-            <p class="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-slate-400">Sign in</p>
-            <h2 class="mt-2 text-[1.9rem] font-semibold tracking-[-0.06em] text-slate-950">
-              Access your workspace
-            </h2>
-          </div>
-
+        <form class="mt-6 space-y-4" on:submit|preventDefault={submitLogin}>
           <label class="block">
             <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Email</span>
             <input
-              class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
+              type="email"
+              autocomplete="username"
+              placeholder="name@team.com"
+              class="w-full border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-300 focus:border-sky-500"
               bind:value={loginEmail}
             />
           </label>
@@ -103,32 +148,33 @@
             <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Password</span>
             <input
               type="password"
-              class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
+              autocomplete="current-password"
+              placeholder="비밀번호를 입력하세요"
+              class="w-full border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-300 focus:border-sky-500"
               bind:value={loginPassword}
             />
           </label>
 
           <button
-            type="button"
-            class="w-full rounded-full bg-sky-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-sky-800"
-            on:click={() => dispatch("login", { email: loginEmail, password: loginPassword })}
+            type="submit"
+            disabled={!canLogin}
+            class="w-full bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            Sign in
+            로그인
           </button>
-        </div>
-      {:else}
-        <div class="mt-6 space-y-4">
-          <div>
-            <p class="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-slate-400">Sign up</p>
-            <h2 class="mt-2 text-[1.9rem] font-semibold tracking-[-0.06em] text-slate-950">
-              Create a member account
-            </h2>
-          </div>
 
+          {#if status?.message}
+            <p class={`text-sm leading-6 ${statusClass}`}>{status.message}</p>
+          {/if}
+        </form>
+      {:else}
+        <form class="mt-6 space-y-4" on:submit|preventDefault={submitSignup}>
           <label class="block">
             <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Name</span>
             <input
-              class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
+              autocomplete="name"
+              placeholder="이름"
+              class="w-full border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-300 focus:border-sky-500"
               bind:value={signupName}
             />
           </label>
@@ -136,7 +182,10 @@
           <label class="block">
             <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Email</span>
             <input
-              class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
+              type="email"
+              autocomplete="email"
+              placeholder="name@team.com"
+              class="w-full border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-300 focus:border-sky-500"
               bind:value={signupEmail}
             />
           </label>
@@ -145,29 +194,26 @@
             <span class="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Password</span>
             <input
               type="password"
-              class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100"
+              autocomplete="new-password"
+              placeholder="새 비밀번호를 입력하세요"
+              class="w-full border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-300 focus:border-sky-500"
               bind:value={signupPassword}
             />
           </label>
 
           <button
-            type="button"
-            class="w-full rounded-full bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
-            on:click={() =>
-              dispatch("signup", {
-                email: signupEmail,
-                name: signupName,
-                password: signupPassword
-              })}
+            type="submit"
+            disabled={!canSignup}
+            class="w-full bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            Create account
+            계정 만들기
           </button>
-        </div>
-      {/if}
 
-      {#if status?.message}
-        <p class="mt-5 text-sm text-slate-500">{status.message}</p>
+          {#if status?.message}
+            <p class={`text-sm leading-6 ${statusClass}`}>{status.message}</p>
+          {/if}
+        </form>
       {/if}
     </aside>
-  </div>
+  </main>
 </div>

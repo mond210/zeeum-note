@@ -12,6 +12,7 @@ const emptyDraft = () => ({
 });
 
 const emptyAdminConsole = () => ({
+  ai: null,
   files: {
     storeFiles: [],
     uploads: []
@@ -58,6 +59,7 @@ const initialState = {
   loadingProject: false,
   memberDirectory: [],
   members: [],
+  openPageIds: [],
   pageDirty: false,
   pageDraft: emptyDraft(),
   pages: [],
@@ -81,7 +83,7 @@ function parseLocation(pathname) {
 
   if (normalizedPath === "/admin" || normalizedPath.startsWith("/admin/")) {
     const section = normalizedPath.split("/").filter(Boolean)[1] || "dashboard";
-    const allowed = ["dashboard", "projects", "files", "members"];
+    const allowed = ["dashboard", "projects", "files", "members", "ai"];
     return {
       route: "admin",
       section: allowed.includes(section) ? section : "dashboard"
@@ -180,6 +182,48 @@ function orderedRootSelection(pageIds, pages) {
   const order = new Map(buildPageTree(pages).map((page, index) => [page.id, index]));
 
   return [...roots].sort((left, right) => (order.get(left) ?? 0) - (order.get(right) ?? 0));
+}
+
+function pruneOpenPageIds(openPageIds, pages) {
+  const validPageIds = new Set((pages || []).map((page) => page.id));
+
+  return Array.from(new Set((openPageIds || []).filter((pageId) => validPageIds.has(pageId))));
+}
+
+function includeOpenPageId(openPageIds, pageId) {
+  if (!pageId) {
+    return Array.from(new Set(openPageIds || []));
+  }
+
+  return Array.from(new Set([...(openPageIds || []), pageId]));
+}
+
+function adjacentOpenPageId(openPageIds, closingPageId) {
+  const index = (openPageIds || []).indexOf(closingPageId);
+
+  if (index < 0) {
+    return Array.isArray(openPageIds) && openPageIds.length > 0
+      ? openPageIds[openPageIds.length - 1]
+      : null;
+  }
+
+  return openPageIds[index + 1] || openPageIds[index - 1] || null;
+}
+
+function firstMatchingPageId(candidateIds, pages) {
+  const validPageIds = new Set((pages || []).map((page) => page.id));
+
+  return (candidateIds || []).find((pageId) => pageId && validPageIds.has(pageId)) || null;
+}
+
+function collectDeletedPageIds(pages, rootPageIds) {
+  return (pages || [])
+    .filter((page) => {
+      return (rootPageIds || []).some((rootPageId) => {
+        return page.id === rootPageId || isDescendant(pages, rootPageId, page.id);
+      });
+    })
+    .map((page) => page.id);
 }
 
 function reindexLocalSiblings(pages, projectId, parentId) {
@@ -321,11 +365,12 @@ function createAppStore() {
     }));
   }
 
-  function clearPageSelection() {
+  function clearPageSelection({ clearOpenPages = false } = {}) {
     clearAutosaveTimer();
     update((state) => ({
       ...state,
       loadingPage: false,
+      openPageIds: clearOpenPages ? [] : state.openPageIds,
       pageDirty: false,
       pageDraft: emptyDraft(),
       selectedPage: null,
@@ -358,15 +403,31 @@ function createAppStore() {
     }
 
     const payload = await api.getProject(state.activeProjectId);
+    const projectPages = payload.pages || [];
+    const selectedSummary = state.selectedPageId
+      ? projectPages.find((page) => page.id === state.selectedPageId) || null
+      : null;
+
     update((current) => ({
       ...current,
       activeProject: payload.project,
       groups: payload.groups,
-      pages: payload.pages
+      openPageIds: pruneOpenPageIds(current.openPageIds, projectPages),
+      pageDraft:
+        selectedSummary && !current.pageDirty
+          ? {
+              ...current.pageDraft,
+              contentFormat: selectedSummary.contentFormat,
+              icon: selectedSummary.icon,
+              title: selectedSummary.title
+            }
+          : current.pageDraft,
+      pages: projectPages,
+      selectedPage: selectedSummary || current.selectedPage
     }));
     mergeProject(payload.project);
 
-    if (state.selectedPageId && !payload.pages.some((page) => page.id === state.selectedPageId)) {
+    if (state.selectedPageId && !projectPages.some((page) => page.id === state.selectedPageId)) {
       clearPageSelection();
       update((current) => ({
         ...current,
@@ -392,6 +453,7 @@ function createAppStore() {
       update((state) => ({
         ...state,
         loadingPage: false,
+        openPageIds: includeOpenPageId(state.openPageIds, payload.page.id),
         pageDirty: false,
         pageDraft: {
           content: payload.page.content,
@@ -430,8 +492,9 @@ function createAppStore() {
       route = "project-home",
       markOpened = true
     } = options;
+    const state = snapshot();
 
-    if (!snapshot().authenticated) {
+    if (!state.authenticated) {
       return;
     }
 
@@ -453,14 +516,25 @@ function createAppStore() {
       }
 
       const payload = await api.getProject(projectId);
+      const projectChanged = state.activeProjectId !== payload.project.id;
+      const projectPages = payload.pages || [];
       const nextPageId =
         route === "page"
-          ? pageId || payload.project.homePageId || payload.pages[0]?.id || null
+          ? pageId || payload.project.homePageId || projectPages[0]?.id || null
           : null;
       const selectedSummary =
         route === "page" && nextPageId
-          ? payload.pages.find((page) => page.id === nextPageId) || null
+          ? projectPages.find((page) => page.id === nextPageId) || null
           : null;
+      const nextOpenPageIds =
+        route === "page" && nextPageId
+          ? includeOpenPageId(
+              pruneOpenPageIds(projectChanged ? [] : state.openPageIds, projectPages),
+              nextPageId
+            )
+          : projectChanged
+            ? []
+            : pruneOpenPageIds(state.openPageIds, projectPages);
 
       update((state) => ({
         ...state,
@@ -469,6 +543,7 @@ function createAppStore() {
         groups: payload.groups,
         loadingProject: false,
         loadingPage: route === "page" && !!nextPageId,
+        openPageIds: nextOpenPageIds,
         pageDraft:
           route === "page" && nextPageId
             ? {
@@ -478,7 +553,7 @@ function createAppStore() {
                 title: selectedSummary?.title || ""
               }
             : state.pageDraft,
-        pages: payload.pages,
+        pages: projectPages,
         route,
         searchQuery: route === "project-home" ? "" : state.searchQuery,
         selectedPage: selectedSummary,
@@ -536,6 +611,7 @@ function createAppStore() {
       adminLoading: false,
       adminSection: "dashboard",
       groups: [],
+      openPageIds: [],
       pages: [],
       route: "launcher",
       searchQuery: ""
@@ -599,61 +675,60 @@ function createAppStore() {
     const location = parseLocation(window.location.pathname);
     const fallbackProjectId = preferredProjectId(payload);
 
-    if (location.route === "launcher") {
-      update((state) => ({ ...state, booting: false }));
-      await openLauncher({ replace: true });
-      return;
-    }
+    try {
+      if (location.route === "launcher") {
+        await openLauncher({ replace: true });
+        return;
+      }
 
-    if (location.route === "admin") {
-      update((state) => ({ ...state, booting: false }));
-      await openAdminConsole(location.section, { replace: true });
-      return;
-    }
+      if (location.route === "admin") {
+        await openAdminConsole(location.section, { replace: true });
+        return;
+      }
 
-    if (location.route === "page" || location.route === "project-home" || location.route === "settings") {
-      update((state) => ({ ...state, booting: false }));
-      await enterProject(location.projectId, {
-        pageId: location.pageId,
-        replace: true,
-        route: location.route
-      });
-      return;
-    }
-
-    update((state) => ({ ...state, booting: false }));
-
-    if (location.route === "legacy-page" && location.pageId) {
-      try {
-        const locator = await api.locatePage(location.pageId);
-        await enterProject(locator.projectId, {
-          pageId: locator.pageId,
+      if (location.route === "page" || location.route === "project-home" || location.route === "settings") {
+        await enterProject(location.projectId, {
+          pageId: location.pageId,
           replace: true,
-          route: "page"
+          route: location.route
         });
         return;
-      } catch {
-        if (!fallbackProjectId) {
-          await openLauncher({ replace: true });
+      }
+
+      if (location.route === "legacy-page" && location.pageId) {
+        try {
+          const locator = await api.locatePage(location.pageId);
+          await enterProject(locator.projectId, {
+            pageId: locator.pageId,
+            replace: true,
+            route: "page"
+          });
           return;
+        } catch {
+          if (!fallbackProjectId) {
+            await openLauncher({ replace: true });
+            return;
+          }
         }
       }
+
+      if (!fallbackProjectId) {
+        await openLauncher({ replace: true });
+        return;
+      }
+
+      const legacyRoute =
+        location.route === "legacy-groups" || location.route === "legacy-preferences"
+          ? "settings"
+          : "page";
+
+      await enterProject(fallbackProjectId, {
+        replace: true,
+        route: legacyRoute
+      });
+    } finally {
+      update((state) => ({ ...state, booting: false }));
     }
-
-    if (!fallbackProjectId) {
-      await openLauncher({ replace: true });
-      return;
-    }
-
-    const legacyRoute =
-      location.route === "legacy-groups" || location.route === "legacy-preferences"
-        ? "settings"
-        : "page";
-
-    await enterProject(fallbackProjectId, {
-      replace: true,
-      route: legacyRoute
-    });
   }
 
   async function bootstrap() {
@@ -812,9 +887,55 @@ function createAppStore() {
     });
   }
 
+  async function closeOpenPage(pageId) {
+    const state = snapshot();
+
+    if (!state.activeProjectId || !state.openPageIds.includes(pageId)) {
+      return;
+    }
+
+    const remainingOpenPageIds = state.openPageIds.filter((openPageId) => openPageId !== pageId);
+
+    if (pageId !== state.selectedPageId) {
+      update((current) => ({
+        ...current,
+        openPageIds: remainingOpenPageIds
+      }));
+      return;
+    }
+
+    const nextPageId = adjacentOpenPageId(state.openPageIds, pageId);
+
+    if (nextPageId && remainingOpenPageIds.includes(nextPageId)) {
+      await enterProject(state.activeProjectId, {
+        pageId: nextPageId,
+        replace: true,
+        route: "page",
+        markOpened: false
+      });
+
+      update((current) => ({
+        ...current,
+        openPageIds: current.openPageIds.filter((openPageId) => openPageId !== pageId)
+      }));
+      return;
+    }
+
+    await enterProject(state.activeProjectId, {
+      replace: true,
+      route: "project-home",
+      markOpened: false
+    });
+
+    update((current) => ({
+      ...current,
+      openPageIds: []
+    }));
+  }
+
   async function createPageRecord({
     parentId = null,
-    title = "New page",
+    title = "new page",
     icon = "file-text",
     content = EMPTY_DOC,
     contentFormat = "tiptap-json",
@@ -861,7 +982,7 @@ function createAppStore() {
     try {
       const page = await createPageRecord({
         parentId,
-        title: "New page"
+        title: "new page"
       });
       setStatus("Page created", "success");
       return page;
@@ -905,8 +1026,26 @@ function createAppStore() {
 
     await api.deletePage(state.activeProjectId, pageId);
     const payload = await refreshProjectContext();
-    const nextPageId =
-      payload?.project.homePageId || payload?.pages[0]?.id || null;
+    const remainingPages = payload?.pages || [];
+    const remainingOpenPageIds = pruneOpenPageIds(
+      state.openPageIds.filter((openPageId) => openPageId !== pageId),
+      remainingPages
+    );
+    const nextPageId = firstMatchingPageId(
+      [
+        adjacentOpenPageId(state.openPageIds, pageId),
+        ...remainingOpenPageIds,
+        payload?.project.homePageId,
+        remainingPages[0]?.id
+      ],
+      remainingPages
+    );
+    const selectedPageStillExists = remainingPages.some((page) => page.id === state.selectedPageId);
+
+    if (state.selectedPageId && state.selectedPageId !== pageId && selectedPageStillExists) {
+      setStatus("Page deleted", "success");
+      return;
+    }
 
     if (nextPageId) {
       await enterProject(state.activeProjectId, {
@@ -916,7 +1055,7 @@ function createAppStore() {
         markOpened: false
       });
     } else {
-      clearPageSelection();
+      clearPageSelection({ clearOpenPages: true });
       update((current) => ({
         ...current,
         route: "project-home"
@@ -1105,12 +1244,35 @@ function createAppStore() {
     setStatus("Deleting pages...", "pending");
 
     try {
+      const deletedPageIds = collectDeletedPageIds(state.pages, roots);
+
       for (const pageId of roots) {
         await api.deletePage(state.activeProjectId, pageId);
       }
 
       const payload = await refreshProjectContext();
-      const nextPageId = payload?.project.homePageId || payload?.pages[0]?.id || null;
+      const remainingPages = payload?.pages || [];
+      const remainingOpenPageIds = pruneOpenPageIds(
+        state.openPageIds.filter((pageId) => !deletedPageIds.includes(pageId)),
+        remainingPages
+      );
+      const nextPageId = firstMatchingPageId(
+        [
+          adjacentOpenPageId(state.openPageIds, state.selectedPageId),
+          ...remainingOpenPageIds,
+          payload?.project.homePageId,
+          remainingPages[0]?.id
+        ],
+        remainingPages
+      );
+      const selectedPageDeleted =
+        !!state.selectedPageId && deletedPageIds.includes(state.selectedPageId);
+      const selectedPageStillExists = remainingPages.some((page) => page.id === state.selectedPageId);
+
+      if (state.selectedPageId && !selectedPageDeleted && selectedPageStillExists) {
+        setStatus("Pages deleted", "success");
+        return;
+      }
 
       if (nextPageId) {
         await enterProject(state.activeProjectId, {
@@ -1120,7 +1282,7 @@ function createAppStore() {
           markOpened: false
         });
       } else {
-        clearPageSelection();
+        clearPageSelection({ clearOpenPages: true });
         update((current) => ({
           ...current,
           route: "project-home"
@@ -1238,8 +1400,7 @@ function createAppStore() {
       const result = await api.authLogin(credentials);
       storeAuthToken(result.sessionToken);
       const payload = await bootstrapWithToken(result.sessionToken);
-      applyAuthenticatedLauncher(payload);
-      await openLauncher({ replace: true });
+      await applyAuthenticatedBootstrap(payload);
       return true;
     } catch (error) {
       setStatus(error.message, "error");
@@ -1254,8 +1415,7 @@ function createAppStore() {
       const result = await api.authSignup(payload);
       storeAuthToken(result.sessionToken);
       const nextPayload = await bootstrapWithToken(result.sessionToken);
-      applyAuthenticatedLauncher(nextPayload);
-      await openLauncher({ replace: true });
+      await applyAuthenticatedBootstrap(nextPayload);
       return true;
     } catch (error) {
       setStatus(error.message, "error");
@@ -1310,7 +1470,7 @@ function createAppStore() {
       };
     });
 
-    clearPageSelection();
+    clearPageSelection({ clearOpenPages: true });
     await Promise.all([refreshLauncherData(), refreshAdminConsole()]);
     setStatus("Project removed", "success");
   }
@@ -1319,6 +1479,10 @@ function createAppStore() {
     await api.adminDeleteUpload(filename);
     await refreshAdminConsole();
     setStatus("File removed", "success");
+  }
+
+  async function refreshActiveProject() {
+    return refreshProjectContext();
   }
 
   window.addEventListener("popstate", async () => {
@@ -1385,6 +1549,7 @@ function createAppStore() {
     createPage,
     createFolder,
     createProject,
+    closeOpenPage,
     deleteProjectAsAdmin,
     deleteUpload,
     deleteGroup,
@@ -1400,6 +1565,7 @@ function createAppStore() {
     openLauncher,
     logout,
     renamePage,
+    refreshActiveProject,
     saveGroup,
     saveGroupMembers,
     savePage,

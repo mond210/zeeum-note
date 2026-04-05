@@ -30,6 +30,7 @@ const dataDir = path.join(rootDir, "data");
 const uploadDir = path.join(dataDir, "uploads");
 
 const files = {
+  aiSettings: path.join(dataDir, "ai-settings.json"),
   groups: path.join(dataDir, "groups.json"),
   legacyNotes: path.join(dataDir, "notes.json"),
   members: path.join(dataDir, "members.json"),
@@ -57,12 +58,106 @@ const sessionCookieName = "zeeum_session";
 const sessionTtlMs = 1000 * 60 * 60 * 24 * 7;
 const passwordIterations = 120000;
 const sessionSecret = process.env.SESSION_SECRET || "zeeum-dev-session-secret";
+const aiPreviewTtlMs = 1000 * 60 * 15;
 const collabWriteTimers = new Map();
 const connectionUsers = new WeakMap();
+const aiPreviewCache = new Map();
+const openAiCodexOAuthFlows = new Map();
+const openAiCodexOAuthEvents = new Map();
+let openAiCodexLoopbackServer = null;
+let openAiCodexLoopbackServerPromise = null;
 let baseStateCache = null;
 let baseStatePromise = null;
 let revisionsCache = null;
 let revisionsPromise = null;
+
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
+const OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_SCOPE = "openid profile email offline_access";
+const OPENAI_CODEX_CALLBACK_PORT = 1455;
+const OPENAI_CODEX_CALLBACK_HOST = "0.0.0.0";
+const OPENAI_CODEX_CALLBACK_PUBLIC_URL = "http://localhost:1455/auth/callback";
+const OPENAI_CODEX_CALLBACK_PATH = "/auth/callback";
+const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const OPENAI_CODEX_OAUTH_TTL_MS = 1000 * 60 * 10;
+const OPENAI_CODEX_MODEL_IDS = [
+  "gpt-5.4",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.2",
+  "gpt-5.2-codex"
+];
+
+function openAiCodexStaticModels() {
+  return OPENAI_CODEX_MODEL_IDS.map((id) =>
+    normalizeAiModelEntry({
+      contextWindow: null,
+      description: "Curated OpenAI Codex model",
+      id,
+      label: id,
+      provider: OPENAI_CODEX_PROVIDER_ID,
+      supportsSpeechToText: false,
+      supportsTextGeneration: true
+    })
+  );
+}
+
+const aiProviderCatalog = {
+  claude: {
+    capabilities: ["textGeneration"],
+    defaultBaseUrl: "https://api.anthropic.com",
+    id: "claude",
+    label: "Claude"
+  },
+  gemini: {
+    capabilities: ["textGeneration"],
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    id: "gemini",
+    label: "Gemini"
+  },
+  ollama: {
+    capabilities: ["textGeneration"],
+    defaultBaseUrl: "http://localhost:11434/api",
+    id: "ollama",
+    label: "Ollama"
+  },
+  openai: {
+    capabilities: ["speechToText", "textGeneration"],
+    defaultBaseUrl: "https://api.openai.com/v1",
+    id: "openai",
+    label: "OpenAI"
+  },
+  [OPENAI_CODEX_PROVIDER_ID]: {
+    capabilities: ["textGeneration"],
+    defaultBaseUrl: OPENAI_CODEX_BASE_URL,
+    experimental: true,
+    id: OPENAI_CODEX_PROVIDER_ID,
+    label: "OpenAI Codex"
+  },
+  openrouter: {
+    capabilities: ["textGeneration"],
+    defaultBaseUrl: "https://openrouter.ai/api/v1",
+    id: "openrouter",
+    label: "OpenRouter"
+  }
+};
+
+const aiProfileCatalog = {
+  speechToText: {
+    defaultModel: "gpt-4o-mini-transcribe",
+    id: "speechToText",
+    label: "Speech to text",
+    providers: ["openai"]
+  },
+  textGeneration: {
+    defaultModel: "",
+    id: "textGeneration",
+    label: "Text generation",
+    providers: ["ollama", "openai", "openai-codex", "claude", "gemini", "openrouter"]
+  }
+};
 
 const ServerVideoBlock = TipTapNode.create({
   addAttributes() {
@@ -131,6 +226,23 @@ const upload = multer({
   }
 });
 
+const audioUpload = multer({
+  limits: {
+    fileSize: 1024 * 1024 * 25
+  },
+  storage: multer.memoryStorage(),
+  fileFilter(_req, file, callback) {
+    const mime = file.mimetype || "";
+
+    if (mime.startsWith("audio/") || [".mp3", ".m4a", ".wav", ".webm", ".ogg"].includes(path.extname(file.originalname || "").toLowerCase())) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error("오디오 파일만 전사할 수 있습니다."));
+  }
+});
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -143,6 +255,318 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function httpError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/g, "");
+}
+
+function aiSecretSource() {
+  if (process.env.AI_SETTINGS_SECRET) {
+    return process.env.AI_SETTINGS_SECRET;
+  }
+
+  if (process.env.SESSION_SECRET) {
+    return process.env.SESSION_SECRET;
+  }
+
+  return sessionSecret || null;
+}
+
+function aiSecretKey() {
+  const source = aiSecretSource();
+
+  if (!source) {
+    throw httpError("AI_SETTINGS_SECRET 또는 SESSION_SECRET 이 필요합니다.", 500);
+  }
+
+  return crypto.createHash("sha256").update(String(source)).digest();
+}
+
+function encryptAiSecret(secret) {
+  if (!secret) {
+    return null;
+  }
+
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", aiSecretKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(secret), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return `v1:${iv.toString("base64")}:${tag.toString("base64")}:${encrypted.toString("base64")}`;
+}
+
+function decryptAiSecret(payload) {
+  if (!payload) {
+    return "";
+  }
+
+  const [version, ivRaw, tagRaw, encryptedRaw] = String(payload).split(":");
+
+  if (version !== "v1" || !ivRaw || !tagRaw || !encryptedRaw) {
+    throw httpError("저장된 AI 비밀정보 형식이 올바르지 않습니다.", 500);
+  }
+
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    aiSecretKey(),
+    Buffer.from(ivRaw, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(tagRaw, "base64"));
+
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(encryptedRaw, "base64")),
+    decipher.final()
+  ]);
+
+  return decrypted.toString("utf8");
+}
+
+function maskApiKeyHint(apiKey) {
+  const value = String(apiKey || "").trim();
+
+  if (!value) {
+    return null;
+  }
+
+  return value.length <= 4 ? `••••${value}` : `••••${value.slice(-4)}`;
+}
+
+function maskAccountIdHint(accountId) {
+  const value = String(accountId || "").trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (value.length <= 8) {
+    return `••••${value}`;
+  }
+
+  return `${value.slice(0, 4)}••••${value.slice(-4)}`;
+}
+
+function normalizeEncryptedValue(value) {
+  return typeof value === "string" && value ? value : null;
+}
+
+function decodeOpenAiCodexJwt(token) {
+  const value = String(token || "").trim();
+
+  if (!value) {
+    return null;
+  }
+
+  const parts = value.split(".");
+
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  try {
+    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function openAiCodexAccountIdFromAccessToken(accessToken) {
+  const payload = decodeOpenAiCodexJwt(accessToken);
+  const auth = payload?.["https://api.openai.com/auth"];
+  const accountId =
+    auth?.chatgpt_account_user_id ||
+    auth?.chatgpt_user_id ||
+    auth?.user_id ||
+    (payload?.iss && payload?.sub ? `${payload.iss}|${payload.sub}` : null) ||
+    payload?.sub;
+
+  return typeof accountId === "string" && accountId.trim() ? accountId.trim() : null;
+}
+
+function providerDefaultConfig(providerId) {
+  const meta = aiProviderCatalog[providerId];
+  const timestamp = nowIso();
+  const isOpenAiCodex = providerId === OPENAI_CODEX_PROVIDER_ID;
+
+  return {
+    apiKeyEncrypted: null,
+    apiKeyHint: null,
+    baseUrl: meta?.defaultBaseUrl || "",
+    enabled: providerId === "ollama",
+    lastTest: {
+      checkedAt: null,
+      message: "Not tested",
+      ok: false
+    },
+    modelCache: {
+      error: null,
+      fetchedAt: null,
+      models: isOpenAiCodex ? openAiCodexStaticModels() : []
+    },
+    oauthAccessEncrypted: null,
+    oauthAccountIdEncrypted: null,
+    oauthExpiresEncrypted: null,
+    oauthRefreshEncrypted: null,
+    updatedAt: timestamp
+  };
+}
+
+function defaultAiSettings() {
+  return {
+    profiles: Object.fromEntries(
+      Object.values(aiProfileCatalog).map((profile) => [
+        profile.id,
+        {
+          model: profile.defaultModel,
+          provider: profile.providers[0] || null,
+          updatedAt: nowIso()
+        }
+      ])
+    ),
+    providers: Object.fromEntries(
+      Object.values(aiProviderCatalog).map((provider) => [provider.id, providerDefaultConfig(provider.id)])
+    ),
+    version: 1
+  };
+}
+
+function normalizeAiModelEntry(entry = {}) {
+  return {
+    contextWindow: Number(entry.contextWindow || entry.maxInputTokens || entry.inputTokenLimit || 0) || null,
+    description: typeof entry.description === "string" ? entry.description : "",
+    id: typeof entry.id === "string" ? entry.id : "",
+    label: typeof entry.label === "string" ? entry.label : typeof entry.id === "string" ? entry.id : "",
+    provider: typeof entry.provider === "string" ? entry.provider : "",
+    supportsSpeechToText: Boolean(entry.supportsSpeechToText),
+    supportsTextGeneration: Boolean(entry.supportsTextGeneration)
+  };
+}
+
+function normalizeAiSettings(settings) {
+  const defaults = defaultAiSettings();
+  const next = {
+    ...defaults,
+    ...((settings && typeof settings === "object") ? settings : {})
+  };
+
+  next.providers = Object.fromEntries(
+    Object.keys(aiProviderCatalog).map((providerId) => {
+      const defaultsForProvider = providerDefaultConfig(providerId);
+      const current = next.providers?.[providerId] || {};
+
+      return [
+        providerId,
+        {
+          ...defaultsForProvider,
+          ...current,
+          apiKeyEncrypted:
+            typeof current.apiKeyEncrypted === "string" && current.apiKeyEncrypted
+              ? current.apiKeyEncrypted
+              : null,
+          apiKeyHint:
+            typeof current.apiKeyHint === "string" && current.apiKeyHint
+              ? current.apiKeyHint
+              : null,
+          baseUrl: stripTrailingSlash(current.baseUrl || defaultsForProvider.baseUrl),
+          enabled: typeof current.enabled === "boolean" ? current.enabled : defaultsForProvider.enabled,
+          lastTest: {
+            ...defaultsForProvider.lastTest,
+            ...(current.lastTest || {})
+          },
+          modelCache: {
+            ...defaultsForProvider.modelCache,
+            ...(current.modelCache || {}),
+            models: Array.isArray(current.modelCache?.models) && current.modelCache.models.length > 0
+              ? current.modelCache.models.map(normalizeAiModelEntry).filter((model) => model.id)
+              : defaultsForProvider.modelCache.models
+          },
+          oauthAccessEncrypted: normalizeEncryptedValue(current.oauthAccessEncrypted),
+          oauthAccountIdEncrypted: normalizeEncryptedValue(current.oauthAccountIdEncrypted),
+          oauthExpiresEncrypted: normalizeEncryptedValue(current.oauthExpiresEncrypted),
+          oauthRefreshEncrypted: normalizeEncryptedValue(current.oauthRefreshEncrypted),
+          updatedAt: current.updatedAt || defaultsForProvider.updatedAt
+        }
+      ];
+    })
+  );
+
+  next.profiles = Object.fromEntries(
+    Object.keys(aiProfileCatalog).map((profileId) => {
+      const current = next.profiles?.[profileId] || {};
+      const defaultsForProfile = aiProfileCatalog[profileId];
+      const provider =
+        typeof current.provider === "string" && defaultsForProfile.providers.includes(current.provider)
+          ? current.provider
+          : defaultsForProfile.providers[0] || null;
+
+      return [
+        profileId,
+        {
+          model: typeof current.model === "string" ? current.model : defaultsForProfile.defaultModel,
+          provider,
+          updatedAt: current.updatedAt || nowIso()
+        }
+      ];
+    })
+  );
+
+  next.version = 1;
+  return next;
+}
+
+function sanitizeAiSettingsForClient(settings) {
+  const normalized = normalizeAiSettings(settings);
+
+  return {
+    profiles: normalized.profiles,
+    providerCatalog: Object.values(aiProviderCatalog),
+    providers: Object.fromEntries(
+      Object.entries(normalized.providers).map(([providerId, config]) => [
+        providerId,
+        {
+          ...config,
+          apiKeyEncrypted: undefined,
+          hasApiKey: Boolean(config.apiKeyEncrypted),
+          oauthAccessEncrypted: undefined,
+          oauthAccountIdEncrypted: undefined,
+          oauthExpiresEncrypted: undefined,
+          oauthRefreshEncrypted: undefined,
+          oauth: providerId === OPENAI_CODEX_PROVIDER_ID
+            ? {
+                accountIdHint: maskAccountIdHint(
+                  (() => {
+                    try {
+                      return decryptAiSecret(config.oauthAccountIdEncrypted);
+                    } catch {
+                      return "";
+                    }
+                  })()
+                ),
+                connected: Boolean(config.oauthAccessEncrypted || config.oauthRefreshEncrypted),
+                expiresAt: (() => {
+                  try {
+                    const raw = decryptAiSecret(config.oauthExpiresEncrypted);
+                    const value = Number(raw);
+                    return raw && Number.isFinite(value) ? value : null;
+                  } catch {
+                    return null;
+                  }
+                })()
+              }
+            : null,
+          providerId
+        }
+      ])
+    ),
+    version: normalized.version
+  };
+}
+
 function normalizeEmail(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
@@ -150,6 +574,37 @@ function normalizeEmail(value) {
 function makeTitle(value, fallback = "Untitled") {
   const normalized = typeof value === "string" ? value.trim() : "";
   return normalized.slice(0, 120) || fallback;
+}
+
+function makeUniqueSiblingTitle(pages, { excludePageId = null, parentId = null, projectId, title }) {
+  const normalizedTitle = makeTitle(title, "Untitled page");
+  const siblingTitles = new Set(
+    (pages || [])
+      .filter((page) => {
+        return (
+          page.projectId === projectId &&
+          (page.parentId ?? null) === (parentId ?? null) &&
+          page.id !== excludePageId
+        );
+      })
+      .map((page) => makeTitle(page.title).toLowerCase())
+  );
+
+  if (!siblingTitles.has(normalizedTitle.toLowerCase())) {
+    return normalizedTitle;
+  }
+
+  const match = normalizedTitle.match(/^(.*?)(?: \((\d+)\))?$/);
+  const baseTitle = (match?.[1] || normalizedTitle).trim() || normalizedTitle;
+  let counter = 2;
+  let candidate = `${baseTitle} (${counter})`;
+
+  while (siblingTitles.has(candidate.toLowerCase())) {
+    counter += 1;
+    candidate = `${baseTitle} (${counter})`;
+  }
+
+  return candidate;
 }
 
 function makeDescription(value, fallback = "") {
@@ -615,6 +1070,8 @@ async function writeJson(file, value) {
     baseStateCache.pages = value;
   } else if (file === files.groups) {
     baseStateCache.groups = value;
+  } else if (file === files.aiSettings) {
+    baseStateCache.aiSettings = value;
   } else if (file === files.users) {
     baseStateCache.users = value;
   } else if (file === files.members) {
@@ -636,6 +1093,120 @@ function sortPagesWithinProject(pages) {
 
     return (left.parentId || "").localeCompare(right.parentId || "");
   });
+}
+
+function isFolderPage(page) {
+  return page?.icon === "folder_open";
+}
+
+function canParentAcceptChild(parent, child) {
+  if (!parent) {
+    return true;
+  }
+
+  if (isFolderPage(parent)) {
+    return true;
+  }
+
+  return !isFolderPage(child);
+}
+
+function nearestValidContainerParentId(pagesById, page) {
+  let currentId = page.parentId ?? null;
+  const visited = new Set([page.id]);
+
+  while (currentId) {
+    if (visited.has(currentId)) {
+      return null;
+    }
+
+    visited.add(currentId);
+
+    const parent = pagesById.get(currentId);
+
+    if (!parent || parent.projectId !== page.projectId) {
+      return null;
+    }
+
+    if (canParentAcceptChild(parent, page)) {
+      return parent.id;
+    }
+
+    currentId = parent.parentId ?? null;
+  }
+
+  return null;
+}
+
+function normalizePageHierarchy(pages) {
+  const originalOrder = new Map(pages.map((page, index) => [page.id, index]));
+  const pagesById = new Map(pages.map((page) => [page.id, page]));
+  const normalized = pages.map((page, index) => {
+    const currentParentId = page.parentId ?? null;
+    const nextParentId = currentParentId
+      ? nearestValidContainerParentId(pagesById, page)
+      : null;
+    const parentChanged = currentParentId !== nextParentId;
+
+    return {
+      ...page,
+      parentId: nextParentId,
+      position: parentChanged ? 1_000_000 + index : page.position
+    };
+  });
+
+  const projectIds = new Set(normalized.map((page) => page.projectId));
+
+  projectIds.forEach((projectId) => {
+    const parentIds = new Set(
+      normalized
+        .filter((page) => page.projectId === projectId)
+        .map((page) => page.parentId ?? null)
+    );
+
+    parentIds.forEach((parentId) => {
+      const siblings = normalized
+        .filter(
+          (page) =>
+            page.projectId === projectId && (page.parentId ?? null) === (parentId ?? null)
+        )
+        .sort((left, right) => {
+          if (left.position === right.position) {
+            return (originalOrder.get(left.id) ?? 0) - (originalOrder.get(right.id) ?? 0);
+          }
+
+          return left.position - right.position;
+        });
+
+      siblings.forEach((page, index) => {
+        page.position = index;
+      });
+    });
+  });
+
+  return normalized;
+}
+
+function resolveRequestedParentId(pages, projectId, requestedParentId, child) {
+  if (!requestedParentId) {
+    return { parentId: null };
+  }
+
+  const parent = pages.find((page) => page.projectId === projectId && page.id === requestedParentId);
+
+  if (!parent) {
+    return { error: "대상 위치를 찾을 수 없습니다." };
+  }
+
+  if (!canParentAcceptChild(parent, child)) {
+    return {
+      error: isFolderPage(child)
+        ? "폴더는 루트 또는 폴더 아래에만 둘 수 있습니다."
+        : "페이지는 루트, 페이지, 또는 폴더 아래에 둘 수 있습니다."
+    };
+  }
+
+  return { parentId: parent.id };
 }
 
 function ensureProjectShape(project, pages) {
@@ -677,6 +1248,7 @@ async function ensureStore() {
   await fs.mkdir(uploadDir, { recursive: true });
 
   const existingState = await Promise.all([
+    readJson(files.aiSettings, null),
     readJson(files.projects, null),
     readJson(files.revisions, null),
     readJson(files.users, null),
@@ -688,8 +1260,17 @@ async function ensureStore() {
     readJson(files.legacyNotes, null)
   ]);
 
-  let [projects, revisions, users, workspace, pages, groups, members, preferences, legacyNotes] = existingState;
+  let [aiSettings, projects, revisions, users, workspace, pages, groups, members, preferences, legacyNotes] = existingState;
   let changed = false;
+
+  const normalizedAiSettings = normalizeAiSettings(aiSettings);
+
+  if (JSON.stringify(normalizedAiSettings) !== JSON.stringify(aiSettings)) {
+    aiSettings = normalizedAiSettings;
+    changed = true;
+  } else {
+    aiSettings = normalizedAiSettings;
+  }
 
   if (!Array.isArray(members) || members.length === 0) {
     members = defaultMembers();
@@ -775,6 +1356,15 @@ async function ensureStore() {
     pages = sanitizedPages;
   }
 
+  const normalizedHierarchyPages = normalizePageHierarchy(pages);
+
+  if (JSON.stringify(normalizedHierarchyPages) !== JSON.stringify(pages)) {
+    pages = normalizedHierarchyPages;
+    changed = true;
+  } else {
+    pages = normalizedHierarchyPages;
+  }
+
   if (!Array.isArray(groups) || groups.length === 0) {
     groups = defaultGroups(fallbackProjectId);
     changed = true;
@@ -816,6 +1406,7 @@ async function ensureStore() {
 
   if (changed) {
     await Promise.all([
+      writeJson(files.aiSettings, aiSettings),
       writeJson(files.users, users),
       writeJson(files.members, members),
       writeJson(files.preferences, preferences),
@@ -864,14 +1455,23 @@ async function loadBaseState() {
 
   if (!baseStatePromise) {
     baseStatePromise = Promise.all([
+      readJson(files.aiSettings, defaultAiSettings()),
       readJson(files.projects, []),
       readJson(files.pages, []),
       readJson(files.groups, []),
       readJson(files.users, []),
       readJson(files.members, []),
       readJson(files.preferences, defaultPreferences())
-    ]).then(([projects, pages, groups, users, members, preferences]) => {
-      baseStateCache = { projects, pages, groups, users, members, preferences };
+    ]).then(([aiSettings, projects, pages, groups, users, members, preferences]) => {
+      baseStateCache = {
+        aiSettings: normalizeAiSettings(aiSettings),
+        groups,
+        members,
+        pages,
+        preferences,
+        projects,
+        users
+      };
       baseStatePromise = null;
       return baseStateCache;
     });
@@ -948,11 +1548,16 @@ function makePage(seed, pages) {
     (page) =>
       page.projectId === seed.projectId && (page.parentId ?? null) === (parentId ?? null)
   ).length;
+  const title = makeUniqueSiblingTitle(pages, {
+    parentId,
+    projectId: seed.projectId,
+    title: seed.title
+  });
 
   return {
     id: crypto.randomUUID(),
     projectId: seed.projectId,
-    title: makeTitle(seed.title, "Untitled page"),
+    title,
     parentId,
     position,
     icon: typeof seed.icon === "string" ? seed.icon : "file-text",
@@ -1002,18 +1607,201 @@ function pageText(page) {
 }
 
 function proseDocFromMarkdown(markdownText) {
-  const lines = String(markdownText || "").split(/\n+/).filter((line) => line.trim().length > 0);
+  const lines = String(markdownText || "").replace(/\r\n/g, "\n").split("\n");
+  const content = [];
+  let codeLines = [];
+  let inCodeBlock = false;
+  let listType = null;
+  let listItems = [];
+  let paragraphLines = [];
 
-  if (lines.length === 0) {
-    return clone(EMPTY_DOC);
+  function textParagraph(text) {
+    const value = String(text || "").trim();
+
+    if (!value) {
+      return { type: "paragraph" };
+    }
+
+    return {
+      type: "paragraph",
+      content: [{ type: "text", text: value }]
+    };
   }
+
+  function flushParagraph() {
+    if (paragraphLines.length === 0) {
+      return;
+    }
+
+    content.push(textParagraph(paragraphLines.join(" ").trim()));
+    paragraphLines = [];
+  }
+
+  function flushList() {
+    if (!listType || listItems.length === 0) {
+      listItems = [];
+      listType = null;
+      return;
+    }
+
+    content.push({
+      type: listType,
+      content: listItems
+    });
+    listItems = [];
+    listType = null;
+  }
+
+  function flushCodeBlock() {
+    if (codeLines.length === 0) {
+      content.push({
+        type: "codeBlock"
+      });
+      return;
+    }
+
+    content.push({
+      type: "codeBlock",
+      content: [
+        {
+          type: "text",
+          text: codeLines.join("\n")
+        }
+      ]
+    });
+    codeLines = [];
+  }
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "");
+    const trimmed = line.trim();
+
+    if (inCodeBlock) {
+      if (/^```/.test(trimmed)) {
+        flushCodeBlock();
+        inCodeBlock = false;
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+
+    if (/^```/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      inCodeBlock = true;
+      codeLines = [];
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const headingMatch = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      content.push({
+        type: "heading",
+        attrs: {
+          level: headingMatch[1].length
+        },
+        content: [{ type: "text", text: headingMatch[2].trim() }]
+      });
+      continue;
+    }
+
+    if (/^(?:---|\*\*\*|___)\s*$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      content.push({ type: "horizontalRule" });
+      continue;
+    }
+
+    const blockquoteMatch = /^>\s?(.*)$/.exec(trimmed);
+
+    if (blockquoteMatch) {
+      flushParagraph();
+      flushList();
+      content.push({
+        type: "blockquote",
+        content: [textParagraph(blockquoteMatch[1])]
+      });
+      continue;
+    }
+
+    const taskMatch = /^-\s\[( |x|X)\]\s+(.+)$/.exec(trimmed);
+
+    if (taskMatch) {
+      flushParagraph();
+
+      if (listType !== "taskList") {
+        flushList();
+        listType = "taskList";
+      }
+
+      listItems.push({
+        type: "taskItem",
+        attrs: {
+          checked: /x/i.test(taskMatch[1])
+        },
+        content: [textParagraph(taskMatch[2])]
+      });
+      continue;
+    }
+
+    const bulletMatch = /^[-*]\s+(.+)$/.exec(trimmed);
+
+    if (bulletMatch) {
+      flushParagraph();
+
+      if (listType !== "bulletList") {
+        flushList();
+        listType = "bulletList";
+      }
+
+      listItems.push({
+        type: "listItem",
+        content: [textParagraph(bulletMatch[1])]
+      });
+      continue;
+    }
+
+    const orderedMatch = /^\d+\.\s+(.+)$/.exec(trimmed);
+
+    if (orderedMatch) {
+      flushParagraph();
+
+      if (listType !== "orderedList") {
+        flushList();
+        listType = "orderedList";
+      }
+
+      listItems.push({
+        type: "listItem",
+        content: [textParagraph(orderedMatch[1])]
+      });
+      continue;
+    }
+
+    flushList();
+    paragraphLines.push(trimmed);
+  }
+
+  if (inCodeBlock) {
+    flushCodeBlock();
+  }
+
+  flushParagraph();
+  flushList();
 
   return {
     type: "doc",
-    content: lines.map((line) => ({
-      type: "paragraph",
-      content: [{ type: "text", text: line }]
-    }))
+    content: content.length > 0 ? content : clone(EMPTY_DOC.content)
   };
 }
 
@@ -1431,6 +2219,1412 @@ function closeCollaborationConnection(doc, conn) {
   conn.close();
 }
 
+function jsonResponseSafe(text) {
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+async function requestJson(url, { body, headers = {}, method = "GET", timeoutMs = 20000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: {
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...headers
+      },
+      method,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    const payload = jsonResponseSafe(text);
+
+    if (!response.ok) {
+      const message =
+        payload?.error?.message ||
+        payload?.error ||
+        payload?.message ||
+        text ||
+        `${response.status} ${response.statusText}`;
+      throw httpError(message, 502);
+    }
+
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw httpError("요청 시간이 초과되었습니다.", 504);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestFormData(url, { formData, headers = {}, method = "POST", timeoutMs = 30000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      body: formData,
+      headers,
+      method,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    const payload = jsonResponseSafe(text);
+
+    if (!response.ok) {
+      const message =
+        payload?.error?.message ||
+        payload?.error ||
+        payload?.message ||
+        text ||
+        `${response.status} ${response.statusText}`;
+      throw httpError(message, 502);
+    }
+
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw httpError("요청 시간이 초과되었습니다.", 504);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function requestSessionToken(req) {
+  const authHeader = req.headers.authorization || "";
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+
+  if (authHeader.startsWith("Bearer ")) {
+    return authHeader.slice("Bearer ".length).trim();
+  }
+
+  const authParam = requestUrl.searchParams.get("auth") || "";
+  if (authParam) {
+    return authParam;
+  }
+
+  const cookies = parseCookies(req.headers.cookie || "");
+  return cookies[sessionCookieName] || "";
+}
+
+function openAiCodexSessionScopeKey(req) {
+  const sessionToken = requestSessionToken(req);
+  const session = readSessionToken(sessionToken);
+
+  if (!session || !req.currentUser) {
+    return null;
+  }
+
+  return `${req.currentUser.id}:${crypto.createHash("sha256").update(sessionToken).digest("hex")}`;
+}
+
+function openAiCodexFlowKey(state) {
+  return String(state || "").trim();
+}
+
+function clearOpenAiCodexOAuthFlowsForSession(sessionScopeKey) {
+  for (const [state, flow] of openAiCodexOAuthFlows.entries()) {
+    if (flow.sessionScopeKey === sessionScopeKey) {
+      clearOpenAiCodexOAuthFlow(state);
+    }
+  }
+}
+
+function setOpenAiCodexOAuthEvent(sessionScopeKey, patch = {}) {
+  if (!sessionScopeKey) {
+    return null;
+  }
+
+  const current = openAiCodexOAuthEvents.get(sessionScopeKey) || {
+    connected: false,
+    message: "",
+    providerId: OPENAI_CODEX_PROVIDER_ID,
+    updatedAt: null
+  };
+  const next = {
+    ...current,
+    ...patch,
+    providerId: OPENAI_CODEX_PROVIDER_ID,
+    updatedAt: nowIso()
+  };
+
+  openAiCodexOAuthEvents.set(sessionScopeKey, next);
+  return next;
+}
+
+function clearOpenAiCodexOAuthEvent(sessionScopeKey) {
+  if (!sessionScopeKey) {
+    return;
+  }
+
+  openAiCodexOAuthEvents.delete(sessionScopeKey);
+}
+
+function closeOpenAiCodexLoopbackServerIfIdle() {
+  if (openAiCodexOAuthFlows.size > 0 || !openAiCodexLoopbackServer) {
+    return;
+  }
+
+  const server = openAiCodexLoopbackServer;
+  openAiCodexLoopbackServer = null;
+  openAiCodexLoopbackServerPromise = null;
+  server.close();
+}
+
+function clearOpenAiCodexOAuthFlow(state) {
+  const key = openAiCodexFlowKey(state);
+  const flow = openAiCodexOAuthFlows.get(key);
+
+  if (flow?.timeout) {
+    clearTimeout(flow.timeout);
+  }
+
+  openAiCodexOAuthFlows.delete(key);
+  closeOpenAiCodexLoopbackServerIfIdle();
+}
+
+async function ensureOpenAiCodexLoopbackServer() {
+  if (openAiCodexLoopbackServer) {
+    return openAiCodexLoopbackServer;
+  }
+
+  if (!openAiCodexLoopbackServerPromise) {
+    openAiCodexLoopbackServerPromise = new Promise((resolve, reject) => {
+      const listener = app.listen(OPENAI_CODEX_CALLBACK_PORT, OPENAI_CODEX_CALLBACK_HOST, () => {
+        openAiCodexLoopbackServer = listener;
+        openAiCodexLoopbackServerPromise = null;
+        resolve(listener);
+      });
+
+      listener.once("error", (error) => {
+        openAiCodexLoopbackServer = null;
+        openAiCodexLoopbackServerPromise = null;
+        reject(
+          httpError(
+            `OpenAI Codex OAuth callback listener를 localhost:${OPENAI_CODEX_CALLBACK_PORT} 에 열지 못했습니다. 다른 프로세스가 포트를 사용 중인지 확인하세요.`,
+            500
+          )
+        );
+      });
+    });
+  }
+
+  return openAiCodexLoopbackServerPromise;
+}
+
+function getOpenAiCodexOAuthFlowByState(state) {
+  return openAiCodexOAuthFlows.get(openAiCodexFlowKey(state)) || null;
+}
+
+function createOpenAiCodexPkce() {
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+
+  return { challenge, verifier };
+}
+
+function buildOpenAiCodexAuthorizeUrl({ callbackUrl, state, challenge }) {
+  const url = new URL(OPENAI_CODEX_AUTHORIZE_URL);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", OPENAI_CODEX_CLIENT_ID);
+  url.searchParams.set("redirect_uri", callbackUrl);
+  url.searchParams.set("scope", OPENAI_CODEX_SCOPE);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", state);
+  url.searchParams.set("id_token_add_organizations", "true");
+  url.searchParams.set("codex_cli_simplified_flow", "true");
+  url.searchParams.set("originator", "zeeum-note");
+
+  return url.toString();
+}
+
+async function requestOpenAiCodexTokens({ code, codeVerifier, redirectUri, grantType = "authorization_code", refreshToken = "" }) {
+  const body = new URLSearchParams({
+    client_id: OPENAI_CODEX_CLIENT_ID,
+    grant_type: grantType,
+    redirect_uri: redirectUri
+  });
+
+  if (grantType === "authorization_code") {
+    body.set("code", code);
+    body.set("code_verifier", codeVerifier);
+  } else {
+    body.set("refresh_token", refreshToken);
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch(OPENAI_CODEX_TOKEN_URL, {
+      body,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      method: "POST",
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    const payload = jsonResponseSafe(text);
+
+    if (!response.ok) {
+      const message =
+        payload?.error?.message ||
+        payload?.error_description ||
+        payload?.error ||
+        text ||
+        `${response.status} ${response.statusText}`;
+      throw httpError(`OpenAI Codex OAuth 토큰 교환에 실패했습니다. ${message}`, 502);
+    }
+
+    const access = typeof payload.access_token === "string" ? payload.access_token : "";
+    const refresh = typeof payload.refresh_token === "string" ? payload.refresh_token : "";
+    const expiresIn = Number(payload.expires_in);
+
+    if (!access || !refresh || !Number.isFinite(expiresIn)) {
+      throw httpError("OpenAI Codex OAuth 응답 형식이 올바르지 않습니다.", 502);
+    }
+
+    return {
+      access,
+      expiresAt: nowMs() + expiresIn * 1000,
+      refresh
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw httpError("OpenAI Codex OAuth 요청 시간이 초과되었습니다.", 504);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function getOpenAiCodexStoredOAuth(state) {
+  const settings = normalizeAiSettings(state.aiSettings);
+  const config = settings.providers[OPENAI_CODEX_PROVIDER_ID];
+
+  if (!config) {
+    return null;
+  }
+
+  const access = config.oauthAccessEncrypted ? decryptAiSecret(config.oauthAccessEncrypted) : "";
+  const refresh = config.oauthRefreshEncrypted ? decryptAiSecret(config.oauthRefreshEncrypted) : "";
+  const accountId = config.oauthAccountIdEncrypted ? decryptAiSecret(config.oauthAccountIdEncrypted) : "";
+  const expiresRaw = config.oauthExpiresEncrypted ? decryptAiSecret(config.oauthExpiresEncrypted) : "";
+  const expiresAt = Number(expiresRaw);
+
+  return {
+    access,
+    accountId: typeof accountId === "string" ? accountId : "",
+    connected: Boolean(access || refresh),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+    refresh
+  };
+}
+
+async function persistOpenAiCodexOAuthCredentials(credentials) {
+  const state = await loadState();
+  const next = normalizeAiSettings(state.aiSettings);
+  const current = next.providers[OPENAI_CODEX_PROVIDER_ID];
+
+  if (!current) {
+    return next;
+  }
+
+  const accountId = openAiCodexAccountIdFromAccessToken(credentials.access) || credentials.accountId || "";
+
+  next.providers[OPENAI_CODEX_PROVIDER_ID] = {
+    ...current,
+    oauthAccessEncrypted: encryptAiSecret(credentials.access),
+    oauthAccountIdEncrypted: encryptAiSecret(accountId),
+    oauthExpiresEncrypted: encryptAiSecret(String(credentials.expiresAt)),
+    oauthRefreshEncrypted: encryptAiSecret(credentials.refresh),
+    updatedAt: nowIso()
+  };
+
+  await writeJson(files.aiSettings, next);
+  return next;
+}
+
+async function clearOpenAiCodexOAuthCredentials() {
+  const state = await loadState();
+  const next = normalizeAiSettings(state.aiSettings);
+  const current = next.providers[OPENAI_CODEX_PROVIDER_ID];
+
+  if (!current) {
+    return next;
+  }
+
+  next.providers[OPENAI_CODEX_PROVIDER_ID] = {
+    ...current,
+    oauthAccessEncrypted: null,
+    oauthAccountIdEncrypted: null,
+    oauthExpiresEncrypted: null,
+    oauthRefreshEncrypted: null,
+    updatedAt: nowIso()
+  };
+
+  await writeJson(files.aiSettings, next);
+  return next;
+}
+
+function openAiCodexOauthStatus(state, req) {
+  const stored = getOpenAiCodexStoredOAuth(state);
+  const sessionScopeKey = openAiCodexSessionScopeKey(req);
+  const flow = [...openAiCodexOAuthFlows.values()].find((entry) => entry.sessionScopeKey === sessionScopeKey);
+  const event = sessionScopeKey ? openAiCodexOAuthEvents.get(sessionScopeKey) || null : null;
+
+  return {
+    accountIdHint: maskAccountIdHint(stored?.accountId || ""),
+    connected: Boolean(stored?.connected),
+    expiresAt: stored?.expiresAt || null,
+    message:
+      event?.message ||
+      (stored?.connected
+        ? "ChatGPT OAuth 연결이 완료되었습니다."
+        : flow
+          ? "ChatGPT OAuth 인증을 기다리는 중입니다."
+          : ""),
+    pending: Boolean(flow),
+    stateExpiresAt: flow?.expiresAt || null,
+    updatedAt: event?.updatedAt || null,
+    providerId: OPENAI_CODEX_PROVIDER_ID
+  };
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function buildOpenAiCodexOAuthHtml(title, message, tone = "success") {
+  const palette =
+    tone === "error"
+      ? { bg: "#fef2f2", border: "#fecaca", text: "#b91c1c" }
+      : { bg: "#f0fdf4", border: "#bbf7d0", text: "#166534" };
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 32px; background: #f8fafc; color: #0f172a; }
+    main { max-width: 560px; margin: 0 auto; padding: 24px; border: 1px solid ${palette.border}; background: ${palette.bg}; color: ${palette.text}; }
+    h1 { margin: 0 0 12px; font-size: 1.25rem; }
+    p { margin: 0; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+  </main>
+  <script>
+    try {
+      window.opener?.postMessage({ type: "openai-codex-oauth", ok: ${tone !== "error"} }, window.location.origin);
+    } catch {}
+    setTimeout(() => window.close(), 1500);
+  </script>
+</body>
+</html>`;
+}
+
+function providerSupportsProfile(providerId, profileId) {
+  return Boolean(aiProfileCatalog[profileId]?.providers.includes(providerId));
+}
+
+function currentProviderConfig(state, providerId) {
+  const settings = normalizeAiSettings(state.aiSettings);
+  const config = settings.providers[providerId];
+
+  if (!config) {
+    throw httpError("지원하지 않는 provider 입니다.", 404);
+  }
+
+  return config;
+}
+
+function runtimeProviderConfig(state, providerId, draft = {}) {
+  const config = currentProviderConfig(state, providerId);
+  const isOpenAiCodex = providerId === OPENAI_CODEX_PROVIDER_ID;
+  const merged = {
+    ...config,
+    ...draft,
+    baseUrl: isOpenAiCodex
+      ? aiProviderCatalog[providerId].defaultBaseUrl
+      : stripTrailingSlash(draft.baseUrl || config.baseUrl || aiProviderCatalog[providerId].defaultBaseUrl)
+  };
+
+  const apiKey =
+    typeof draft.apiKey === "string" && draft.apiKey.trim()
+      ? draft.apiKey.trim()
+      : decryptAiSecret(config.apiKeyEncrypted);
+
+  return {
+    ...merged,
+    apiKey,
+    providerId
+  };
+}
+
+function ensureProviderAccess(runtimeConfig) {
+  if (!runtimeConfig.baseUrl) {
+    throw httpError("Base URL 이 필요합니다.");
+  }
+
+  if (runtimeConfig.providerId !== "ollama" && !runtimeConfig.apiKey) {
+    throw httpError("API key 가 설정되지 않았습니다.");
+  }
+}
+
+function openAiCompatibleHeaders(runtimeConfig) {
+  return {
+    Authorization: `Bearer ${runtimeConfig.apiKey}`
+  };
+}
+
+function normalizeOpenAiModelEntry(providerId, entry) {
+  const modelId = typeof entry?.id === "string" ? entry.id : "";
+  const lower = modelId.toLowerCase();
+  const supportsSpeechToText = /transcribe|whisper/.test(lower);
+
+  return normalizeAiModelEntry({
+    description: "",
+    id: modelId,
+    label: modelId,
+    provider: providerId,
+    supportsSpeechToText,
+    supportsTextGeneration: !supportsSpeechToText
+  });
+}
+
+async function listOllamaModels(runtimeConfig) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/tags`);
+
+  return (payload.models || [])
+    .map((entry) =>
+      normalizeAiModelEntry({
+        contextWindow: null,
+        description: entry?.details?.family || "",
+        id: entry?.model || entry?.name || "",
+        label: entry?.name || entry?.model || "",
+        provider: "ollama",
+        supportsSpeechToText: false,
+        supportsTextGeneration: true
+      })
+    )
+    .filter((model) => model.id);
+}
+
+async function listOpenAiModels(runtimeConfig) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/models`, {
+    headers: openAiCompatibleHeaders(runtimeConfig)
+  });
+
+  return (payload.data || []).map((entry) => normalizeOpenAiModelEntry("openai", entry)).filter((model) => model.id);
+}
+
+async function listAnthropicModels(runtimeConfig) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/v1/models`, {
+    headers: {
+      "anthropic-version": "2023-06-01",
+      "X-Api-Key": runtimeConfig.apiKey
+    }
+  });
+
+  return (payload.data || [])
+    .map((entry) =>
+      normalizeAiModelEntry({
+        contextWindow: entry?.max_input_tokens || null,
+        description: "",
+        id: entry?.id || "",
+        label: entry?.display_name || entry?.id || "",
+        provider: "claude",
+        supportsSpeechToText: false,
+        supportsTextGeneration: true
+      })
+    )
+    .filter((model) => model.id);
+}
+
+async function listGeminiModels(runtimeConfig) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/models?key=${encodeURIComponent(runtimeConfig.apiKey)}`);
+
+  return (payload.models || [])
+    .map((entry) => {
+      const methods = Array.isArray(entry?.supportedGenerationMethods)
+        ? entry.supportedGenerationMethods
+        : [];
+      const id = entry?.baseModelId || String(entry?.name || "").replace(/^models\//, "");
+
+      return normalizeAiModelEntry({
+        contextWindow: entry?.inputTokenLimit || null,
+        description: entry?.description || "",
+        id,
+        label: entry?.displayName || id,
+        provider: "gemini",
+        supportsSpeechToText: false,
+        supportsTextGeneration: methods.includes("generateContent")
+      });
+    })
+    .filter((model) => model.id);
+}
+
+async function listOpenRouterModels(runtimeConfig) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/models`, {
+    headers: openAiCompatibleHeaders(runtimeConfig)
+  });
+
+  return (payload.data || [])
+    .map((entry) =>
+      normalizeAiModelEntry({
+        contextWindow: entry?.context_length || null,
+        description: entry?.description || "",
+        id: entry?.id || "",
+        label: entry?.name || entry?.id || "",
+        provider: "openrouter",
+        supportsSpeechToText: false,
+        supportsTextGeneration:
+          Array.isArray(entry?.architecture?.output_modalities)
+            ? entry.architecture.output_modalities.includes("text")
+            : true
+      })
+    )
+    .filter((model) => model.id);
+}
+
+async function listModelsForProvider(runtimeConfig) {
+  if (runtimeConfig.providerId === OPENAI_CODEX_PROVIDER_ID) {
+    return openAiCodexStaticModels();
+  }
+
+  ensureProviderAccess(runtimeConfig);
+
+  if (runtimeConfig.providerId === "ollama") {
+    return listOllamaModels(runtimeConfig);
+  }
+
+  if (runtimeConfig.providerId === "openai") {
+    return listOpenAiModels(runtimeConfig);
+  }
+
+  if (runtimeConfig.providerId === "claude") {
+    return listAnthropicModels(runtimeConfig);
+  }
+
+  if (runtimeConfig.providerId === "gemini") {
+    return listGeminiModels(runtimeConfig);
+  }
+
+  if (runtimeConfig.providerId === "openrouter") {
+    return listOpenRouterModels(runtimeConfig);
+  }
+
+  throw httpError("지원하지 않는 provider 입니다.", 404);
+}
+
+function filterModelsForProfile(models, profileId) {
+  if (profileId === "speechToText") {
+    return models.filter((model) => model.supportsSpeechToText);
+  }
+
+  return models.filter((model) => model.supportsTextGeneration);
+}
+
+function providerPromptText(systemPrompt, userPrompt) {
+  return `${systemPrompt.trim()}\n\n${userPrompt.trim()}`;
+}
+
+async function generateOllamaText(runtimeConfig, prompt) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/chat`, {
+    body: {
+      messages: [
+        {
+          content: prompt.system,
+          role: "system"
+        },
+        {
+          content: prompt.user,
+          role: "user"
+        }
+      ],
+      model: runtimeConfig.model,
+      options: {
+        temperature: 0.2
+      },
+      stream: false
+    },
+    method: "POST"
+  });
+
+  return payload?.message?.content || "";
+}
+
+async function generateOpenAiCompatibleText(runtimeConfig, prompt) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/chat/completions`, {
+    body: {
+      messages: [
+        {
+          content: prompt.system,
+          role: "system"
+        },
+        {
+          content: prompt.user,
+          role: "user"
+        }
+      ],
+      model: runtimeConfig.model,
+      temperature: 0.2
+    },
+    headers: openAiCompatibleHeaders(runtimeConfig),
+    method: "POST"
+  });
+
+  return payload?.choices?.[0]?.message?.content || "";
+}
+
+async function generateAnthropicText(runtimeConfig, prompt) {
+  const payload = await requestJson(`${runtimeConfig.baseUrl}/v1/messages`, {
+    body: {
+      max_tokens: 4096,
+      messages: [
+        {
+          content: prompt.user,
+          role: "user"
+        }
+      ],
+      model: runtimeConfig.model,
+      system: prompt.system,
+      temperature: 0.2
+    },
+    headers: {
+      "anthropic-version": "2023-06-01",
+      "X-Api-Key": runtimeConfig.apiKey
+    },
+    method: "POST"
+  });
+
+  return (payload?.content || [])
+    .filter((entry) => entry?.type === "text")
+    .map((entry) => entry.text)
+    .join("\n");
+}
+
+async function generateGeminiText(runtimeConfig, prompt) {
+  const payload = await requestJson(
+    `${runtimeConfig.baseUrl}/models/${encodeURIComponent(runtimeConfig.model)}:generateContent?key=${encodeURIComponent(runtimeConfig.apiKey)}`,
+    {
+      body: {
+        contents: [
+          {
+            parts: [{ text: prompt.user }],
+            role: "user"
+          }
+        ],
+        generationConfig: {
+          temperature: 0.2
+        },
+        systemInstruction: {
+          parts: [{ text: prompt.system }]
+        }
+      },
+      method: "POST"
+    }
+  );
+
+  return (payload?.candidates?.[0]?.content?.parts || [])
+    .map((part) => part?.text || "")
+    .join("\n");
+}
+
+async function generateTextForProfile(state, profileId, prompt) {
+  const settings = normalizeAiSettings(state.aiSettings);
+  const profile = settings.profiles[profileId];
+
+  if (!profile || !profile.provider) {
+    throw httpError("AI profile 이 설정되지 않았습니다.");
+  }
+
+  if (!providerSupportsProfile(profile.provider, profileId)) {
+    throw httpError("선택한 provider 는 이 profile 을 지원하지 않습니다.");
+  }
+
+  const runtimeConfig = runtimeProviderConfig(state, profile.provider);
+
+  if (!profile.model) {
+    throw httpError("AI model 이 선택되지 않았습니다.");
+  }
+
+  runtimeConfig.model = profile.model;
+
+  if (runtimeConfig.providerId === OPENAI_CODEX_PROVIDER_ID) {
+    const stored = getOpenAiCodexStoredOAuth(state);
+
+    if (!stored?.connected) {
+      throw httpError("OpenAI Codex OAuth 연결이 필요합니다.");
+    }
+
+    throw httpError("OpenAI Codex runtime generation은 아직 지원하지 않습니다.", 501);
+  }
+
+  ensureProviderAccess(runtimeConfig);
+
+  if (runtimeConfig.providerId === "ollama") {
+    return generateOllamaText(runtimeConfig, prompt);
+  }
+
+  if (runtimeConfig.providerId === "openai" || runtimeConfig.providerId === "openrouter") {
+    return generateOpenAiCompatibleText(runtimeConfig, prompt);
+  }
+
+  if (runtimeConfig.providerId === "claude") {
+    return generateAnthropicText(runtimeConfig, prompt);
+  }
+
+  if (runtimeConfig.providerId === "gemini") {
+    return generateGeminiText(runtimeConfig, prompt);
+  }
+
+  throw httpError("지원하지 않는 provider 입니다.", 404);
+}
+
+async function transcribeForSpeechProfile(state, file) {
+  const settings = normalizeAiSettings(state.aiSettings);
+  const profile = settings.profiles.speechToText;
+
+  if (!profile?.provider) {
+    throw httpError("Speech-to-text profile 이 설정되지 않았습니다.");
+  }
+
+  if (profile.provider !== "openai") {
+    throw httpError("현재 speech-to-text 는 OpenAI provider 만 지원합니다.");
+  }
+
+  const runtimeConfig = runtimeProviderConfig(state, profile.provider);
+  runtimeConfig.model = profile.model || aiProfileCatalog.speechToText.defaultModel;
+  ensureProviderAccess(runtimeConfig);
+
+  const formData = new FormData();
+  formData.set(
+    "file",
+    new Blob([file.buffer], {
+      type: file.mimetype || "audio/webm"
+    }),
+    file.originalname || "audio.webm"
+  );
+  formData.set("model", runtimeConfig.model);
+  formData.set("response_format", "json");
+
+  const payload = await requestFormData(`${runtimeConfig.baseUrl}/audio/transcriptions`, {
+    formData,
+    headers: openAiCompatibleHeaders(runtimeConfig)
+  });
+
+  return {
+    model: runtimeConfig.model,
+    text: typeof payload?.text === "string" ? payload.text.trim() : ""
+  };
+}
+
+function extractFirstJsonObject(rawText) {
+  const text = String(rawText || "").trim();
+
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+
+  if (start < 0 || end <= start) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function hashFingerprint(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function nowPlusMs(durationMs) {
+  return new Date(nowMs() + durationMs).toISOString();
+}
+
+function cleanupAiPreviews() {
+  const currentMs = nowMs();
+
+  for (const [previewId, preview] of aiPreviewCache.entries()) {
+    if (preview.expiresAtMs <= currentMs) {
+      aiPreviewCache.delete(previewId);
+    }
+  }
+}
+
+function storeAiPreview(preview) {
+  cleanupAiPreviews();
+  const previewId = crypto.randomUUID();
+  const expiresAtMs = nowMs() + aiPreviewTtlMs;
+
+  aiPreviewCache.set(previewId, {
+    ...preview,
+    expiresAtMs
+  });
+
+  return {
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    previewId
+  };
+}
+
+function loadAiPreview(previewId, currentUser, kind) {
+  cleanupAiPreviews();
+  const preview = aiPreviewCache.get(previewId);
+
+  if (!preview || preview.kind !== kind) {
+    throw httpError("미리보기를 찾을 수 없습니다.", 404);
+  }
+
+  if (preview.userId !== currentUser?.id) {
+    throw httpError("다른 사용자의 미리보기는 적용할 수 없습니다.", 403);
+  }
+
+  return preview;
+}
+
+function currentCollaborationDoc(projectId, pageId) {
+  return collabDocs.get(collaborationRoomName(projectId, pageId)) || null;
+}
+
+function pageJsonFromCollaborationDoc(doc) {
+  return normalizeStoredRichDocContent(yDocToProsemirrorJSON(doc));
+}
+
+function replaceCollaborationDocContent(doc, nextContent) {
+  const normalized = normalizeStoredRichDocContent(nextContent);
+  const sourceDoc = prosemirrorJSONToYDoc(collaborationSchema, normalized);
+  const sourceFragment = sourceDoc.getXmlFragment("prosemirror");
+  const targetFragment = doc.getXmlFragment("prosemirror");
+
+  doc.transact(() => {
+    targetFragment.delete(0, targetFragment.length);
+    targetFragment.insert(0, sourceFragment.toArray().map((node) => node.clone()));
+
+    const markdownText = doc.getText("markdown");
+    const nextMarkdown = markdownFromRichDoc(normalized);
+
+    if (markdownText.length > 0) {
+      markdownText.delete(0, markdownText.length);
+    }
+
+    if (nextMarkdown) {
+      markdownText.insert(0, nextMarkdown);
+    }
+  }, { source: "ai-apply" });
+
+  sourceDoc.destroy();
+}
+
+async function currentPageSnapshot(projectId, pageId) {
+  const state = await loadState({ includeRevisions: true });
+  const page = state.pages.find((entry) => entry.projectId === projectId && entry.id === pageId);
+
+  if (!page) {
+    throw httpError("페이지를 찾을 수 없습니다.", 404);
+  }
+
+  const activeDoc = currentCollaborationDoc(projectId, pageId);
+  const content =
+    activeDoc && activeDoc.initialized
+      ? pageJsonFromCollaborationDoc(activeDoc)
+      : collaborationDocJsonFromPage(page);
+  const markdown = markdownFromRichDoc(content);
+
+  return {
+    activeDoc,
+    content,
+    fingerprint: hashFingerprint(JSON.stringify({ markdown, pageId, projectId })),
+    markdown,
+    page,
+    state
+  };
+}
+
+function diffSummary(previousText, nextText) {
+  const parts = diffWordsWithSpace(previousText, nextText);
+  let addedChars = 0;
+  let removedChars = 0;
+
+  for (const part of parts) {
+    if (part.added) {
+      addedChars += part.value.length;
+    } else if (part.removed) {
+      removedChars += part.value.length;
+    }
+  }
+
+  return {
+    addedChars,
+    changed: previousText !== nextText,
+    removedChars
+  };
+}
+
+async function applyMarkdownToPage({ actor, markdown, projectId, pageId }) {
+  const state = await loadState({ includeRevisions: true });
+  const page = state.pages.find((entry) => entry.projectId === projectId && entry.id === pageId);
+
+  if (!page) {
+    throw httpError("페이지를 찾을 수 없습니다.", 404);
+  }
+
+  const nextContent = proseDocFromMarkdown(markdown);
+  const activeDoc = currentCollaborationDoc(projectId, pageId);
+
+  if (activeDoc && activeDoc.initialized) {
+    activeDoc._zeeumLastActor = actor;
+    replaceCollaborationDocContent(activeDoc, nextContent);
+    clearTimeout(collabWriteTimers.get(activeDoc.name));
+    collabWriteTimers.delete(activeDoc.name);
+    await writeCollaborationState(activeDoc);
+    const refreshed = await loadState({ includeRevisions: true });
+    return refreshed.pages.find((entry) => entry.projectId === projectId && entry.id === pageId) || page;
+  }
+
+  const previousPage = clone(page);
+  page.content = normalizeStoredRichDocContent(nextContent);
+  page.contentFormat = "tiptap-json";
+  page.updatedAt = nowIso();
+
+  const nextProjects = touchProject(state.projects, page.projectId);
+  const nextRevisions = appendRevision(
+    state.revisions,
+    createRevision({
+      actor,
+      nextPage: page,
+      previousPage
+    })
+  );
+
+  await Promise.all([
+    writeJson(files.pages, state.pages),
+    writeJson(files.projects, nextProjects),
+    writeJson(files.revisions, nextRevisions)
+  ]);
+
+  return page;
+}
+
+function editorPreviewPrompt(page, markdown, instruction) {
+  return {
+    system:
+      "You edit a workspace document. Return strict JSON only with keys summary and content. content must be the full revised markdown document.",
+    user: [
+      `Page title: ${page.title}`,
+      "",
+      "User instruction:",
+      instruction.trim(),
+      "",
+      "Current markdown:",
+      "```markdown",
+      markdown || "",
+      "```",
+      "",
+      "Return JSON with this shape:",
+      '{"summary":"one short sentence","content":"full revised markdown"}'
+    ].join("\n")
+  };
+}
+
+function editorSummaryPrompt(page, markdown, focus) {
+  return {
+    system: "Summarize the document in concise Korean. Prefer bullet points only when clearly useful.",
+    user: [
+      `Page title: ${page.title}`,
+      focus ? `Focus: ${focus.trim()}` : "",
+      "",
+      "Document markdown:",
+      "```markdown",
+      markdown || "",
+      "```"
+    ]
+      .filter(Boolean)
+      .join("\n")
+  };
+}
+
+function navigationTreeContext(pages, projectId) {
+  return byProject(projectId, pages)
+    .sort((left, right) => {
+      if ((left.parentId || "") === (right.parentId || "")) {
+        return left.position - right.position;
+      }
+
+      return (left.parentId || "").localeCompare(right.parentId || "");
+    })
+    .map((page) => {
+      return [
+        `id=${page.id}`,
+        `title=${JSON.stringify(page.title)}`,
+        `type=${isFolderPage(page) ? "folder" : "page"}`,
+        `parentId=${page.parentId || "null"}`,
+        `position=${page.position}`
+      ].join(" ");
+    })
+    .join("\n");
+}
+
+function normalizeNavigationOperations(rawOperations, pages, projectId) {
+  if (!Array.isArray(rawOperations)) {
+    return [];
+  }
+
+  const pagesById = new Map(
+    byProject(projectId, pages).map((page) => [page.id, page])
+  );
+
+  return rawOperations
+    .map((entry) => {
+      const type = typeof entry?.type === "string" ? entry.type : "";
+      const pageId = typeof entry?.pageId === "string" ? entry.pageId : "";
+      const title = typeof entry?.title === "string" ? makeTitle(entry.title, "") : "";
+      const parentId =
+        typeof entry?.parentId === "string" && entry.parentId.trim()
+          ? entry.parentId
+          : null;
+
+      if (["create_folder", "create_page"].includes(type)) {
+        if (!title) {
+          return null;
+        }
+
+        if (parentId && !pagesById.has(parentId)) {
+          return null;
+        }
+
+        return {
+          parentId,
+          title,
+          type
+        };
+      }
+
+      if (!pageId || !pagesById.has(pageId)) {
+        return null;
+      }
+
+      if (type === "rename_page" && title) {
+        return { pageId, title, type };
+      }
+
+      if (type === "move_page") {
+        if (parentId && !pagesById.has(parentId)) {
+          return null;
+        }
+
+        return { pageId, parentId, type };
+      }
+
+      if (type === "delete_page") {
+        return { pageId, type };
+      }
+
+      return null;
+    })
+    .filter(Boolean)
+    .slice(0, 25);
+}
+
+function navigationPrompt(pages, projectId, instruction, selectedPageIds = []) {
+  return {
+    system: [
+      "You organize a page tree.",
+      "Return strict JSON only with keys summary and operations.",
+      "Allowed operation types: create_folder, create_page, rename_page, move_page, delete_page.",
+      "Never invent page IDs. Use existing IDs exactly. parentId may be null.",
+      "Keep operations conservative and avoid deleting unless the instruction clearly asks for deletion."
+    ].join(" "),
+    user: [
+      "Current tree:",
+      navigationTreeContext(pages, projectId),
+      "",
+      selectedPageIds.length > 0 ? `Selected page IDs: ${selectedPageIds.join(", ")}` : "Selected page IDs: none",
+      "",
+      "User instruction:",
+      instruction.trim(),
+      "",
+      "Return JSON with this shape:",
+      '{"summary":"one short sentence","operations":[{"type":"rename_page","pageId":"...","title":"..."}]}'
+    ].join("\n")
+  };
+}
+
+function navigationFingerprint(pages, projectId) {
+  return hashFingerprint(
+    JSON.stringify(
+      byProject(projectId, pages).map((page) => ({
+        id: page.id,
+        icon: page.icon,
+        parentId: page.parentId,
+        position: page.position,
+        title: page.title,
+        updatedAt: page.updatedAt
+      }))
+    )
+  );
+}
+
+function applyNavigationOperationsToState(state, projectId, operations, actor) {
+  let changed = false;
+
+  for (const operation of operations) {
+    if (operation.type === "create_folder" || operation.type === "create_page") {
+      const parentResolution = resolveRequestedParentId(
+        state.pages,
+        projectId,
+        operation.parentId,
+        { icon: operation.type === "create_folder" ? "folder_open" : "file-text" }
+      );
+
+      if (parentResolution.error) {
+        continue;
+      }
+
+      const page = makePage(
+        {
+          content: clone(EMPTY_DOC),
+          contentFormat: "tiptap-json",
+          icon: operation.type === "create_folder" ? "folder_open" : "file-text",
+          parentId: parentResolution.parentId,
+          projectId,
+          title: operation.title
+        },
+        state.pages
+      );
+
+      state.pages.push(page);
+      state.revisions = appendRevision(
+        state.revisions,
+        createRevision({
+          actor,
+          nextPage: page
+        })
+      );
+      reindexSiblings(state.pages, projectId, parentResolution.parentId);
+      changed = true;
+      continue;
+    }
+
+    const page = state.pages.find((entry) => entry.projectId === projectId && entry.id === operation.pageId);
+
+    if (!page) {
+      continue;
+    }
+
+    if (operation.type === "rename_page") {
+      const previousPage = clone(page);
+      page.title = makeUniqueSiblingTitle(state.pages, {
+        excludePageId: page.id,
+        parentId: page.parentId ?? null,
+        projectId,
+        title: operation.title
+      });
+      page.updatedAt = nowIso();
+      state.revisions = appendRevision(
+        state.revisions,
+        createRevision({
+          actor,
+          nextPage: page,
+          previousPage
+        })
+      );
+      changed = true;
+      continue;
+    }
+
+    if (operation.type === "move_page") {
+      const parentResolution = resolveRequestedParentId(
+        state.pages,
+        projectId,
+        operation.parentId,
+        page
+      );
+
+      if (parentResolution.error || !canMovePage(state.pages, page.id, parentResolution.parentId, projectId)) {
+        continue;
+      }
+
+      const currentParentId = page.parentId ?? null;
+      const siblings = state.pages
+        .filter(
+          (entry) =>
+            entry.projectId === projectId &&
+            entry.id !== page.id &&
+            (entry.parentId ?? null) === (parentResolution.parentId ?? null)
+        )
+        .sort((left, right) => left.position - right.position);
+
+      page.parentId = parentResolution.parentId;
+      page.position = siblings.length;
+      page.updatedAt = nowIso();
+      reindexSiblings(state.pages, projectId, currentParentId);
+      reindexSiblings(state.pages, projectId, parentResolution.parentId);
+      changed = true;
+      continue;
+    }
+
+    if (operation.type === "delete_page") {
+      const idsToDelete = new Set([page.id, ...collectDescendantIds(state.pages, page.id, projectId)]);
+      state.pages = state.pages.filter((entry) => !(entry.projectId === projectId && idsToDelete.has(entry.id)));
+      reindexSiblings(state.pages, projectId, page.parentId ?? null);
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return { changed: false };
+  }
+
+  const nextProjects = touchProject(state.projects, projectId).map((project) => {
+    if (project.id !== projectId) {
+      return project;
+    }
+
+    const projectPages = byProject(project.id, state.pages);
+
+    return {
+      ...project,
+      homePageId:
+        project.homePageId && projectPages.some((page) => page.id === project.homePageId)
+          ? project.homePageId
+          : projectPages[0]?.id || null
+    };
+  });
+
+  state.projects = nextProjects;
+  return { changed: true };
+}
+
+function applyAiSettingsUpdate(currentSettings, payload = {}) {
+  const next = normalizeAiSettings(currentSettings);
+  const timestamp = nowIso();
+
+  for (const providerId of Object.keys(aiProviderCatalog)) {
+    const incoming = payload.providers?.[providerId] || null;
+
+    if (!incoming || typeof incoming !== "object") {
+      continue;
+    }
+
+    const current = next.providers[providerId];
+    const isOpenAiCodex = providerId === OPENAI_CODEX_PROVIDER_ID;
+    const updated = {
+      ...current,
+      baseUrl: isOpenAiCodex
+        ? current.baseUrl
+        : typeof incoming.baseUrl === "string" && incoming.baseUrl.trim()
+          ? stripTrailingSlash(incoming.baseUrl.trim())
+          : current.baseUrl,
+      enabled: typeof incoming.enabled === "boolean" ? incoming.enabled : current.enabled,
+      updatedAt: timestamp
+    };
+
+    if (!isOpenAiCodex && incoming.clearApiKey === true) {
+      updated.apiKeyEncrypted = null;
+      updated.apiKeyHint = null;
+    } else if (!isOpenAiCodex && typeof incoming.apiKey === "string" && incoming.apiKey.trim()) {
+      updated.apiKeyEncrypted = encryptAiSecret(incoming.apiKey.trim());
+      updated.apiKeyHint = maskApiKeyHint(incoming.apiKey.trim());
+    }
+
+    next.providers[providerId] = updated;
+  }
+
+  for (const profileId of Object.keys(aiProfileCatalog)) {
+    const incoming = payload.profiles?.[profileId] || null;
+
+    if (!incoming || typeof incoming !== "object") {
+      continue;
+    }
+
+    const current = next.profiles[profileId];
+    const allowedProviders = aiProfileCatalog[profileId].providers;
+    const provider =
+      typeof incoming.provider === "string" && allowedProviders.includes(incoming.provider)
+        ? incoming.provider
+        : current.provider;
+
+    next.profiles[profileId] = {
+      model: typeof incoming.model === "string" ? incoming.model.trim() : current.model,
+      provider,
+      updatedAt: timestamp
+    };
+  }
+
+  return next;
+}
+
+async function persistProviderDiagnostics(providerId, patch) {
+  const state = await loadState();
+  const next = normalizeAiSettings(state.aiSettings);
+  const current = next.providers[providerId];
+
+  if (!current) {
+    return next;
+  }
+
+  next.providers[providerId] = {
+    ...current,
+    ...patch,
+    lastTest: {
+      ...current.lastTest,
+      ...(patch.lastTest || {})
+    },
+    modelCache: {
+      ...current.modelCache,
+      ...(patch.modelCache || {})
+    },
+    updatedAt: patch.updatedAt || current.updatedAt
+  };
+
+  await writeJson(files.aiSettings, next);
+  return next;
+}
+
 function sendCollaborationMessage(doc, conn, message) {
   if (conn.readyState !== 1) {
     closeCollaborationConnection(doc, conn);
@@ -1603,8 +3797,22 @@ function collectDescendantIds(pages, pageId, projectId) {
 }
 
 function canMovePage(pages, pageId, nextParentId, projectId) {
+  const page = pages.find((entry) => entry.projectId === projectId && entry.id === pageId);
+
+  if (!page) {
+    return false;
+  }
+
   if (!nextParentId) {
     return true;
+  }
+
+  const nextParent = pages.find(
+    (page) => page.projectId === projectId && page.id === nextParentId
+  );
+
+  if (!nextParent || !canParentAcceptChild(nextParent, page)) {
+    return false;
   }
 
   if (pageId === nextParentId) {
@@ -1670,6 +3878,145 @@ function getGroupOr404(groups, projectId, groupId, res) {
 
 function mediaUrl(filename) {
   return `/api/media/${filename}`;
+}
+
+function fileTypeFromName(filename) {
+  const extension = path.extname(filename || "").toLowerCase();
+
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"].includes(extension)) {
+    return "image";
+  }
+
+  if ([".mp4", ".mov", ".webm", ".m4v", ".avi"].includes(extension)) {
+    return "video";
+  }
+
+  return "file";
+}
+
+function sumBytes(entries, key = "size") {
+  return entries.reduce((total, entry) => total + Number(entry?.[key] || 0), 0);
+}
+
+async function listStoreFiles() {
+  const targets = Array.from(new Set(Object.values(files)));
+  const entries = await Promise.all(
+    targets.map(async (filePath) => {
+      try {
+        const stats = await fs.stat(filePath);
+
+        if (!stats.isFile()) {
+          return null;
+        }
+
+        return {
+          category: "store",
+          name: path.basename(filePath),
+          path: path.relative(rootDir, filePath).replaceAll(path.sep, "/"),
+          size: stats.size,
+          updatedAt: stats.mtime.toISOString()
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return entries.filter(Boolean).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function listUploadFiles() {
+  let filenames = [];
+
+  try {
+    filenames = await fs.readdir(uploadDir);
+  } catch {
+    filenames = [];
+  }
+
+  const uploads = await Promise.all(
+    filenames.map(async (filename) => {
+      try {
+        const filePath = path.join(uploadDir, filename);
+        const stats = await fs.stat(filePath);
+
+        if (!stats.isFile()) {
+          return null;
+        }
+
+        return {
+          createdAt: stats.birthtime.toISOString(),
+          filename,
+          path: path.relative(rootDir, filePath).replaceAll(path.sep, "/"),
+          size: stats.size,
+          type: fileTypeFromName(filename),
+          updatedAt: stats.mtime.toISOString(),
+          url: mediaUrl(filename)
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return uploads
+    .filter(Boolean)
+    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+}
+
+async function buildAdminConsolePayload() {
+  const state = await loadState({ includeRevisions: true });
+  const storeFiles = await listStoreFiles();
+  const uploads = await listUploadFiles();
+  const projectRows = [...state.projects]
+    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
+    .map((project) => ({
+      ...projectSummary(project, state.pages, state.groups),
+      homePageTitle:
+        state.pages.find((page) => page.projectId === project.id && page.id === project.homePageId)?.title || null
+    }));
+
+  const uploadTypeTotals = uploads.reduce(
+    (totals, upload) => {
+      totals[upload.type] = (totals[upload.type] || 0) + 1;
+      return totals;
+    },
+    { file: 0, image: 0, video: 0 }
+  );
+
+  return {
+    ai: sanitizeAiSettingsForClient(state.aiSettings),
+    files: {
+      storeFiles,
+      uploads
+    },
+    members: state.users.map(publicUser),
+    overview: {
+      backend: {
+        engine: "filesystem",
+        label: "JSON file store",
+        location: "data/*.json + data/uploads",
+        status: "connected"
+      },
+      recentUploads: uploads.slice(0, 5),
+      storage: {
+        dataBytes: sumBytes(storeFiles),
+        totalBytes: sumBytes(storeFiles) + sumBytes(uploads),
+        uploadBytes: sumBytes(uploads),
+        uploadTypeTotals
+      },
+      totals: {
+        admins: state.users.filter((user) => user.role === "admin").length,
+        files: uploads.length,
+        groups: state.groups.length,
+        members: state.users.length,
+        pages: state.pages.length,
+        projects: state.projects.length,
+        revisions: state.revisions.length
+      }
+    },
+    projects: projectRows
+  };
 }
 
 app.use(async (req, _res, next) => {
@@ -1914,6 +4261,381 @@ app.get("/api/admin/members", requireAdmin, async (_req, res, next) => {
   }
 });
 
+app.get("/api/admin/console", requireAdmin, async (_req, res, next) => {
+  try {
+    res.json(await buildAdminConsolePayload());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/ai/settings", requireAdmin, async (_req, res, next) => {
+  try {
+    const state = await loadState();
+    res.json({
+      ai: sanitizeAiSettingsForClient(state.aiSettings)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/admin/ai/settings", requireAdmin, async (req, res, next) => {
+  try {
+    const state = await loadState();
+    const nextSettings = applyAiSettingsUpdate(state.aiSettings, req.body || {});
+    await writeJson(files.aiSettings, nextSettings);
+
+    res.json({
+      ai: sanitizeAiSettingsForClient(nextSettings)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/ai/providers/:providerId/oauth/start", requireAdmin, async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+
+    if (providerId !== OPENAI_CODEX_PROVIDER_ID) {
+      res.status(404).json({ error: "지원하지 않는 provider 입니다." });
+      return;
+    }
+
+    const sessionScopeKey = openAiCodexSessionScopeKey(req);
+
+    if (!sessionScopeKey) {
+      res.status(401).json({ error: "로그인이 필요합니다." });
+      return;
+    }
+
+    clearOpenAiCodexOAuthFlowsForSession(sessionScopeKey);
+    setOpenAiCodexOAuthEvent(sessionScopeKey, {
+      connected: false,
+      message: "ChatGPT OAuth 창을 열었습니다. 브라우저에서 인증을 완료하세요."
+    });
+
+    await ensureOpenAiCodexLoopbackServer();
+
+    const { challenge, verifier } = createOpenAiCodexPkce();
+    const state = crypto.randomBytes(16).toString("hex");
+    const callbackUrl = OPENAI_CODEX_CALLBACK_PUBLIC_URL;
+    const authorizeUrl = buildOpenAiCodexAuthorizeUrl({
+      callbackUrl,
+      challenge,
+      state
+    });
+    const expiresAt = nowMs() + OPENAI_CODEX_OAUTH_TTL_MS;
+
+    openAiCodexOAuthFlows.set(state, {
+      callbackUrl,
+      createdAt: nowIso(),
+      expiresAt,
+      sessionScopeKey,
+      state,
+      timeout: setTimeout(() => {
+        clearOpenAiCodexOAuthFlow(state);
+      }, OPENAI_CODEX_OAUTH_TTL_MS),
+      userId: req.currentUser.id,
+      verifier
+    });
+
+    res.json({
+      authorizeUrl,
+      callbackUrl,
+      expiresAt,
+      providerId
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/ai/providers/:providerId/oauth/status", requireAdmin, async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+
+    if (providerId !== OPENAI_CODEX_PROVIDER_ID) {
+      res.status(404).json({ error: "지원하지 않는 provider 입니다." });
+      return;
+    }
+
+    const state = await loadState();
+    res.json(openAiCodexOauthStatus(state, req));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/ai/providers/:providerId/oauth/disconnect", requireAdmin, async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+
+    if (providerId !== OPENAI_CODEX_PROVIDER_ID) {
+      res.status(404).json({ error: "지원하지 않는 provider 입니다." });
+      return;
+    }
+
+    const sessionScopeKey = openAiCodexSessionScopeKey(req);
+
+    if (sessionScopeKey) {
+      clearOpenAiCodexOAuthFlowsForSession(sessionScopeKey);
+    }
+
+    await clearOpenAiCodexOAuthCredentials();
+    setOpenAiCodexOAuthEvent(sessionScopeKey, {
+      connected: false,
+      message: "ChatGPT OAuth 연결을 해제했습니다."
+    });
+    const nextSettings = await persistProviderDiagnostics(OPENAI_CODEX_PROVIDER_ID, {
+      lastTest: {
+        checkedAt: nowIso(),
+        message: "ChatGPT OAuth 연결을 해제했습니다.",
+        ok: false
+      },
+      modelCache: {
+        error: null,
+        fetchedAt: nowIso(),
+        models: openAiCodexStaticModels()
+      }
+    });
+
+    res.json({
+      ai: sanitizeAiSettingsForClient(nextSettings),
+      providerId
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get(OPENAI_CODEX_CALLBACK_PATH, async (req, res) => {
+  const state = String(req.query.state || "").trim();
+  const code = String(req.query.code || "").trim();
+  const flow = getOpenAiCodexOAuthFlowByState(state);
+
+  if (!flow) {
+    res.status(400).type("html").send(
+      buildOpenAiCodexOAuthHtml(
+        "OpenAI Codex OAuth failed",
+        "The OAuth session expired or could not be found.",
+        "error"
+      )
+    );
+    return;
+  }
+
+  if (flow.expiresAt <= nowMs()) {
+    setOpenAiCodexOAuthEvent(flow.sessionScopeKey, {
+      connected: false,
+      message: "OAuth 세션이 만료되어 인증을 완료하지 못했습니다."
+    });
+    clearOpenAiCodexOAuthFlow(state);
+    res.status(400).type("html").send(
+      buildOpenAiCodexOAuthHtml(
+        "OpenAI Codex OAuth failed",
+        "The OAuth session expired before the callback was received.",
+        "error"
+      )
+    );
+    return;
+  }
+
+  if (!code) {
+    setOpenAiCodexOAuthEvent(flow.sessionScopeKey, {
+      connected: false,
+      message: "OAuth callback 에 authorization code 가 없습니다."
+    });
+    clearOpenAiCodexOAuthFlow(state);
+    res.status(400).type("html").send(
+      buildOpenAiCodexOAuthHtml(
+        "OpenAI Codex OAuth failed",
+        "Missing authorization code.",
+        "error"
+      )
+    );
+    return;
+  }
+
+  try {
+    const tokens = await requestOpenAiCodexTokens({
+      code,
+      codeVerifier: flow.verifier,
+      redirectUri: flow.callbackUrl
+    });
+
+    clearOpenAiCodexOAuthFlow(state);
+
+    await persistOpenAiCodexOAuthCredentials(tokens);
+    setOpenAiCodexOAuthEvent(flow.sessionScopeKey, {
+      connected: true,
+      message: "ChatGPT OAuth 연결이 완료되었습니다."
+    });
+    await persistProviderDiagnostics(OPENAI_CODEX_PROVIDER_ID, {
+      lastTest: {
+        checkedAt: nowIso(),
+        message: "ChatGPT OAuth 연결이 완료되었습니다.",
+        ok: true
+      },
+      modelCache: {
+        error: null,
+        fetchedAt: nowIso(),
+        models: openAiCodexStaticModels()
+      }
+    });
+
+    res
+      .status(200)
+      .type("html")
+      .send(
+        buildOpenAiCodexOAuthHtml(
+          "OpenAI Codex OAuth complete",
+          "You can close this window and return to Zeeum Note."
+        )
+      );
+  } catch (error) {
+    setOpenAiCodexOAuthEvent(flow.sessionScopeKey, {
+      connected: false,
+      message: error?.message || "OAuth 토큰 교환에 실패했습니다."
+    });
+    clearOpenAiCodexOAuthFlow(state);
+    res.status(error?.statusCode || 502).type("html").send(
+      buildOpenAiCodexOAuthHtml(
+        "OpenAI Codex OAuth failed",
+        error?.message || "Unable to complete the OAuth exchange.",
+        "error"
+      )
+    );
+  }
+});
+
+app.post("/api/admin/ai/providers/:providerId/test", requireAdmin, async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+
+    if (!aiProviderCatalog[providerId]) {
+      res.status(404).json({ error: "지원하지 않는 provider 입니다." });
+      return;
+    }
+
+    const state = await loadState();
+
+    if (providerId === OPENAI_CODEX_PROVIDER_ID) {
+      const status = openAiCodexOauthStatus(state, req);
+
+      if (!status.connected) {
+        res.status(400).json({ error: "ChatGPT OAuth 연결이 필요합니다." });
+        return;
+      }
+
+      const models = openAiCodexStaticModels();
+      const profileId =
+        typeof req.body?.profileId === "string" && aiProfileCatalog[req.body.profileId]
+          ? req.body.profileId
+          : null;
+      const filteredModels = profileId ? filterModelsForProfile(models, profileId) : models;
+      const message =
+        filteredModels.length > 0
+          ? "ChatGPT OAuth 연결이 확인되었습니다."
+          : "연결은 확인했지만 조건에 맞는 모델이 없습니다.";
+
+      if (!req.body?.providerConfig) {
+        await persistProviderDiagnostics(providerId, {
+          lastTest: {
+            checkedAt: nowIso(),
+            message,
+            ok: true
+          },
+          modelCache: {
+            error: null,
+            fetchedAt: nowIso(),
+            models: filteredModels
+          }
+        });
+      }
+
+      res.json({
+        message,
+        models: filteredModels,
+        ok: true,
+        providerId
+      });
+      return;
+    }
+
+    const runtimeConfig = runtimeProviderConfig(state, providerId, req.body?.providerConfig || {});
+    const models = await listModelsForProvider(runtimeConfig);
+    const profileId =
+      typeof req.body?.profileId === "string" && aiProfileCatalog[req.body.profileId]
+        ? req.body.profileId
+        : null;
+    const filteredModels = profileId ? filterModelsForProfile(models, profileId) : models;
+    const message =
+      filteredModels.length > 0
+        ? `${filteredModels.length}개 모델을 확인했습니다.`
+        : "연결은 성공했지만 조건에 맞는 모델이 없습니다.";
+    const diagnostics = {
+      checkedAt: nowIso(),
+      message,
+      ok: true
+    };
+
+    if (!req.body?.providerConfig) {
+      await persistProviderDiagnostics(providerId, {
+        lastTest: diagnostics
+      });
+    }
+
+    res.json({
+      message,
+      models: filteredModels,
+      ok: true,
+      providerId
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/ai/providers/:providerId/models", requireAdmin, async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+
+    if (!aiProviderCatalog[providerId]) {
+      res.status(404).json({ error: "지원하지 않는 provider 입니다." });
+      return;
+    }
+
+    const state = await loadState();
+    const runtimeConfig = runtimeProviderConfig(state, providerId, req.body?.providerConfig || {});
+    const models = await listModelsForProvider(runtimeConfig);
+    const profileId =
+      typeof req.body?.profileId === "string" && aiProfileCatalog[req.body.profileId]
+        ? req.body.profileId
+        : null;
+    const filteredModels = profileId ? filterModelsForProfile(models, profileId) : models;
+
+    if (!req.body?.providerConfig) {
+      await persistProviderDiagnostics(providerId, {
+        modelCache: {
+          error: null,
+          fetchedAt: nowIso(),
+          models: filteredModels
+        }
+      });
+    }
+
+    res.json({
+      fetchedAt: nowIso(),
+      models: filteredModels,
+      providerId
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/admin/members/:memberId", requireAdmin, async (req, res, next) => {
   try {
     const state = await loadState();
@@ -2008,6 +4730,314 @@ app.delete("/api/admin/members/:memberId", requireAdmin, async (req, res, next) 
   } catch (error) {
     next(error);
   }
+});
+
+app.delete("/api/admin/projects/:projectId", requireAdmin, async (req, res, next) => {
+  try {
+    const state = await loadState({ includeRevisions: true });
+    const project = getProjectOr404(state.projects, req.params.projectId, res);
+
+    if (!project) {
+      return;
+    }
+
+    const nextProjects = state.projects.filter((entry) => entry.id !== project.id);
+    const nextPages = state.pages.filter((entry) => entry.projectId !== project.id);
+    const nextGroups = state.groups.filter((entry) => entry.projectId !== project.id);
+    const nextRevisions = state.revisions.filter((entry) => entry.projectId !== project.id);
+
+    await Promise.all([
+      writeJson(files.projects, nextProjects),
+      writeJson(files.pages, nextPages),
+      writeJson(files.groups, nextGroups),
+      writeJson(files.revisions, nextRevisions)
+    ]);
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/admin/files/:filename", requireAdmin, async (req, res, next) => {
+  try {
+    const filename = path.basename(req.params.filename || "");
+
+    if (!filename) {
+      res.status(400).json({ error: "삭제할 파일 이름이 필요합니다." });
+      return;
+    }
+
+    const filePath = path.join(uploadDir, filename);
+    await fs.unlink(filePath);
+    res.status(204).end();
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      res.status(404).json({ error: "파일을 찾을 수 없습니다." });
+      return;
+    }
+
+    next(error);
+  }
+});
+
+app.post("/api/ai/editor/summary", requireAuth, async (req, res, next) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : "";
+    const pageId = typeof req.body?.pageId === "string" ? req.body.pageId : "";
+    const focus = typeof req.body?.focus === "string" ? req.body.focus : "";
+    const snapshot = await currentPageSnapshot(projectId, pageId);
+    const summary = await generateTextForProfile(
+      snapshot.state,
+      "textGeneration",
+      editorSummaryPrompt(snapshot.page, snapshot.markdown, focus)
+    );
+
+    res.json({
+      summary: summary.trim()
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/editor/preview", requireAuth, async (req, res, next) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : "";
+    const pageId = typeof req.body?.pageId === "string" ? req.body.pageId : "";
+    const instruction = typeof req.body?.instruction === "string" ? req.body.instruction.trim() : "";
+
+    if (!instruction) {
+      res.status(400).json({ error: "편집 지시를 입력하세요." });
+      return;
+    }
+
+    const snapshot = await currentPageSnapshot(projectId, pageId);
+    const raw = await generateTextForProfile(
+      snapshot.state,
+      "textGeneration",
+      editorPreviewPrompt(snapshot.page, snapshot.markdown, instruction)
+    );
+    const parsed = extractFirstJsonObject(raw) || {};
+    const nextMarkdown =
+      typeof parsed.content === "string" && parsed.content.trim()
+        ? parsed.content.trim()
+        : raw.trim();
+
+    if (!nextMarkdown) {
+      res.status(502).json({ error: "AI 응답에서 수정된 문서를 만들지 못했습니다." });
+      return;
+    }
+
+    const summary =
+      typeof parsed.summary === "string" && parsed.summary.trim()
+        ? parsed.summary.trim()
+        : "문서 수정안이 준비되었습니다.";
+    const diff = diffSummary(snapshot.markdown, nextMarkdown);
+    const previewMeta = storeAiPreview({
+      afterMarkdown: nextMarkdown,
+      beforeMarkdown: snapshot.markdown,
+      fingerprint: snapshot.fingerprint,
+      kind: "editor",
+      pageId,
+      projectId,
+      userId: req.currentUser.id
+    });
+
+    res.json({
+      afterMarkdown: nextMarkdown,
+      beforeMarkdown: snapshot.markdown,
+      diff,
+      expiresAt: previewMeta.expiresAt,
+      previewId: previewMeta.previewId,
+      summary
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/editor/apply", requireAuth, async (req, res, next) => {
+  try {
+    const previewId = typeof req.body?.previewId === "string" ? req.body.previewId : "";
+    const preview = loadAiPreview(previewId, req.currentUser, "editor");
+    const snapshot = await currentPageSnapshot(preview.projectId, preview.pageId);
+
+    if (snapshot.fingerprint !== preview.fingerprint) {
+      res.status(409).json({ error: "문서가 변경되어 미리보기가 만료되었습니다. 다시 생성하세요." });
+      return;
+    }
+
+    const page = await applyMarkdownToPage({
+      actor: {
+        ...req.currentUser,
+        name: `${req.currentUser.name} (AI)`
+      },
+      markdown: preview.afterMarkdown,
+      pageId: preview.pageId,
+      projectId: preview.projectId
+    });
+
+    aiPreviewCache.delete(previewId);
+    res.json({
+      page
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/editor/insert-transcript", requireAuth, async (req, res, next) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : "";
+    const pageId = typeof req.body?.pageId === "string" ? req.body.pageId : "";
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    const mode = req.body?.mode === "replace" ? "replace" : "append";
+
+    if (!text) {
+      res.status(400).json({ error: "삽입할 전사 텍스트가 없습니다." });
+      return;
+    }
+
+    const snapshot = await currentPageSnapshot(projectId, pageId);
+    const nextMarkdown =
+      mode === "replace"
+        ? text
+        : [snapshot.markdown, text].filter(Boolean).join("\n\n");
+    const page = await applyMarkdownToPage({
+      actor: {
+        ...req.currentUser,
+        name: `${req.currentUser.name} (AI)`
+      },
+      markdown: nextMarkdown,
+      pageId,
+      projectId
+    });
+
+    res.json({
+      page
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/navigation/preview", requireAuth, async (req, res, next) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : "";
+    const instruction = typeof req.body?.instruction === "string" ? req.body.instruction.trim() : "";
+    const selectedPageIds = Array.isArray(req.body?.selectedPageIds)
+      ? req.body.selectedPageIds.filter((pageId) => typeof pageId === "string")
+      : [];
+
+    if (!instruction) {
+      res.status(400).json({ error: "정리 지시를 입력하세요." });
+      return;
+    }
+
+    const state = await loadState({ includeRevisions: true });
+    const project = state.projects.find((entry) => entry.id === projectId);
+
+    if (!project) {
+      res.status(404).json({ error: "프로젝트를 찾을 수 없습니다." });
+      return;
+    }
+
+    const raw = await generateTextForProfile(
+      state,
+      "textGeneration",
+      navigationPrompt(state.pages, projectId, instruction, selectedPageIds)
+    );
+    const parsed = extractFirstJsonObject(raw) || {};
+    const operations = normalizeNavigationOperations(parsed.operations, state.pages, projectId);
+    const previewMeta = storeAiPreview({
+      fingerprint: navigationFingerprint(state.pages, projectId),
+      kind: "navigation",
+      operations,
+      projectId,
+      userId: req.currentUser.id
+    });
+
+    res.json({
+      expiresAt: previewMeta.expiresAt,
+      operations,
+      previewId: previewMeta.previewId,
+      summary:
+        typeof parsed.summary === "string" && parsed.summary.trim()
+          ? parsed.summary.trim()
+          : operations.length > 0
+            ? `${operations.length}개 트리 작업을 제안했습니다.`
+            : "적용할 트리 작업이 없습니다."
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/navigation/apply", requireAuth, async (req, res, next) => {
+  try {
+    const previewId = typeof req.body?.previewId === "string" ? req.body.previewId : "";
+    const preview = loadAiPreview(previewId, req.currentUser, "navigation");
+    const state = await loadState({ includeRevisions: true });
+
+    if (navigationFingerprint(state.pages, preview.projectId) !== preview.fingerprint) {
+      res.status(409).json({ error: "페이지 트리가 변경되어 미리보기가 만료되었습니다. 다시 생성하세요." });
+      return;
+    }
+
+    const result = applyNavigationOperationsToState(
+      state,
+      preview.projectId,
+      preview.operations,
+      {
+        ...req.currentUser,
+        name: `${req.currentUser.name} (AI)`
+      }
+    );
+
+    if (!result.changed) {
+      res.status(400).json({ error: "적용할 작업이 없습니다." });
+      return;
+    }
+
+    await Promise.all([
+      writeJson(files.pages, state.pages),
+      writeJson(files.projects, state.projects),
+      writeJson(files.revisions, state.revisions)
+    ]);
+
+    aiPreviewCache.delete(previewId);
+    res.json({
+      operationsApplied: preview.operations.length,
+      project: state.projects.find((entry) => entry.id === preview.projectId) || null
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/stt/transcribe", requireAuth, (req, res, next) => {
+  audioUpload.single("file")(req, res, async (error) => {
+    if (error) {
+      next(error);
+      return;
+    }
+
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: "전사할 오디오 파일이 없습니다." });
+        return;
+      }
+
+      const state = await loadState();
+      const transcript = await transcribeForSpeechProfile(state, req.file);
+      res.json({
+        transcript
+      });
+    } catch (requestError) {
+      next(requestError);
+    }
+  });
 });
 
 app.get("/api/projects/:projectId", requireAuth, async (req, res, next) => {
@@ -2189,11 +5219,19 @@ app.post("/api/projects/:projectId/pages", requireAuth, async (req, res, next) =
       return;
     }
 
-    const parentId =
-      req.body?.parentId &&
-      state.pages.some((page) => page.projectId === project.id && page.id === req.body.parentId)
-        ? req.body.parentId
-        : null;
+    const parentResolution = resolveRequestedParentId(
+      state.pages,
+      project.id,
+      req.body?.parentId || null,
+      { icon: req.body?.icon }
+    );
+
+    if (parentResolution.error) {
+      res.status(400).json({ error: parentResolution.error });
+      return;
+    }
+
+    const parentId = parentResolution.parentId;
 
     const page = makePage(
       {
@@ -2296,13 +5334,19 @@ app.post("/api/projects/:projectId/pages/:pageId/move", requireAuth, async (req,
       return;
     }
 
-    const nextParentId =
-      req.body?.parentId &&
-      state.pages.some(
-        (entry) => entry.projectId === page.projectId && entry.id === req.body.parentId
-      )
-        ? req.body.parentId
-        : null;
+    const parentResolution = resolveRequestedParentId(
+      state.pages,
+      page.projectId,
+      req.body?.parentId || null,
+      page
+    );
+
+    if (parentResolution.error) {
+      res.status(400).json({ error: parentResolution.error });
+      return;
+    }
+
+    const nextParentId = parentResolution.parentId;
 
     if (!canMovePage(state.pages, page.id, nextParentId, page.projectId)) {
       res.status(400).json({ error: "페이지를 자기 자신 또는 하위 페이지 아래로 이동할 수 없습니다." });
@@ -2565,7 +5609,12 @@ app.get(/^(?!\/api).*/, (_req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({ error: "서버에서 오류가 발생했습니다." });
+  const statusCode = Number(error?.statusCode || error?.status || 500);
+  const message =
+    typeof error?.message === "string" && error.message.trim()
+      ? error.message
+      : "서버에서 오류가 발생했습니다.";
+  res.status(statusCode).json({ error: message });
 });
 
 const server = app.listen(port, "0.0.0.0", async () => {

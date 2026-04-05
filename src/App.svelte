@@ -5,7 +5,6 @@
 <script>
   import AccountMenu from "./components/AccountMenu.svelte";
   import { onMount } from "svelte";
-  import { fade, fly } from "svelte/transition";
   import AdminConsoleView from "./components/AdminConsoleView.svelte";
   import LandingView from "./components/LandingView.svelte";
   import MovePagesDialog from "./components/MovePagesDialog.svelte";
@@ -14,6 +13,7 @@
   import ProjectLauncherView from "./components/ProjectLauncherView.svelte";
   import ProjectSettingsView from "./components/ProjectSettingsView.svelte";
   import ProjectSidebar from "./components/ProjectSidebar.svelte";
+  import { scrollbarActivity } from "./lib/scrollbar-activity.js";
   import { appStore } from "./lib/stores/app.js";
 
   const themeClass = {
@@ -27,8 +27,6 @@
     compact: "density-compact"
   };
 
-  let pagesPanelOpen = false;
-  let sidebarHidden = false;
   let moveDialogPageIds = [];
 
   function handleGlobalSave(event) {
@@ -47,17 +45,8 @@
     event.returnValue = "";
   }
 
-  function closePagesPanel() {
-    pagesPanelOpen = false;
-  }
-
-  function toggleSidebar() {
-    if (window.innerWidth >= 1024) {
-      sidebarHidden = !sidebarHidden;
-      return;
-    }
-
-    pagesPanelOpen = !pagesPanelOpen;
+  function handleSelectPage(pageId) {
+    appStore.selectPage(pageId);
   }
 
   function openMoveDialog(pageIds) {
@@ -66,6 +55,23 @@
 
   function closeMoveDialog() {
     moveDialogPageIds = [];
+  }
+
+  function pageIconGlyph(value) {
+    const map = {
+      "book-open": "menu_book",
+      "check-square": "checklist",
+      "file-text": "description",
+      layers: "inventory_2"
+    };
+
+    return map[value] || value || "description";
+  }
+
+  function handleDeletePages(event) {
+    if (window.confirm(`선택한 ${event.detail.pageIds.length}개 항목을 삭제할까요? 하위 페이지도 함께 삭제됩니다.`)) {
+      appStore.deletePages(event.detail.pageIds);
+    }
   }
 
   onMount(() => {
@@ -86,9 +92,16 @@
       ? `Admin · zeeum-note`
       : $appStore.route === "launcher"
       ? "Workspace · zeeum-note"
-      : $appStore.route === "page" && $appStore.selectedPage
+        : $appStore.route === "page" && $appStore.selectedPage
         ? `${$appStore.selectedPage.title} · zeeum-note`
         : `zeeum-note`;
+  $: openEditorPages = $appStore.openPageIds
+    .map((pageId) => $appStore.pages.find((page) => page.id === pageId))
+    .filter(Boolean);
+  $: shellLayoutClass =
+    $appStore.route === "page"
+      ? "flex min-h-0 flex-1 w-full gap-0"
+      : "mx-auto flex max-w-[1280px] gap-6 px-6 pt-6 sm:px-8 sm:pt-8 lg:px-12 lg:pt-8 xl:px-16";
 </script>
 
 <div
@@ -159,71 +172,105 @@
         appStore.updateMember(event.detail.memberId, event.detail.payload)}
     />
   {:else if $appStore.activeProject}
-    <div class="min-h-screen">
+    <div class={$appStore.route === "page" ? "flex h-screen flex-col overflow-hidden" : "min-h-screen"}>
       <header class="sticky top-0 z-20 w-full border-b border-slate-200/80 bg-white/88 backdrop-blur-md">
-        <div class="mx-auto flex min-h-[4.5rem] max-w-[1280px] flex-wrap items-center justify-between gap-4 px-6 py-3 sm:px-8 lg:px-12 xl:px-16">
-          <div class="flex min-w-0 items-center gap-3">
-            <button
-              type="button"
-              class="grid h-10 w-10 place-items-center rounded-full border border-slate-200 bg-white text-slate-600 transition hover:border-sky-300 hover:text-sky-700"
-              aria-label={pagesPanelOpen || !sidebarHidden ? "Hide files" : "Show files"}
-              title={pagesPanelOpen || !sidebarHidden ? "Hide files" : "Show files"}
-              on:click={toggleSidebar}
-            >
-              <span class="material-symbols-rounded">
-                {pagesPanelOpen || !sidebarHidden ? "left_panel_close" : "left_panel_open"}
-              </span>
-            </button>
-            <button
-              type="button"
-              class="text-sm font-semibold text-slate-950 transition hover:text-sky-700"
-              on:click={() => appStore.openLauncher()}
-            >
-              zeeum-note
-            </button>
-          </div>
+        {#if $appStore.route === "page"}
+          <div class="flex h-[3.25rem] min-w-0 w-full items-stretch">
+            <div class="scroll-thin flex min-w-0 flex-1 items-stretch overflow-x-auto" use:scrollbarActivity>
+              {#each openEditorPages as page}
+                <div
+                  class={`group flex min-w-0 max-w-[260px] shrink-0 items-center gap-2 border-r border-slate-200/80 px-4 py-2 text-left transition ${
+                    $appStore.selectedPageId === page.id
+                      ? "bg-white text-slate-950"
+                      : "text-slate-500 hover:bg-white/70 hover:text-slate-900"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    class="flex min-w-0 flex-1 items-center gap-2"
+                    aria-current={$appStore.selectedPageId === page.id ? "page" : undefined}
+                    on:click={() => appStore.selectPage(page.id)}
+                  >
+                    <span class="material-symbols-rounded shrink-0 text-[18px] text-slate-500">
+                      {pageIconGlyph(page.icon)}
+                    </span>
+                    <span class="truncate text-sm font-medium">{page.title}</span>
+                    {#if $appStore.selectedPageId === page.id && $appStore.pageDirty}
+                      <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-sky-500"></span>
+                    {/if}
+                  </button>
+                  <button
+                    type="button"
+                    class={`grid h-6 w-6 shrink-0 place-items-center rounded-full text-slate-400 transition ${
+                      $appStore.selectedPageId === page.id
+                        ? "hover:bg-slate-100 hover:text-slate-700"
+                        : "hover:bg-slate-200/70 hover:text-slate-700"
+                    }`}
+                    aria-label={`Close ${page.title}`}
+                    on:click={() => appStore.closeOpenPage(page.id)}
+                  >
+                    <span class="material-symbols-rounded text-[16px]">close</span>
+                  </button>
+                </div>
+              {/each}
 
-          <div class="flex min-w-0 items-center gap-3">
-            <AccountMenu
-              align="right"
-              currentUser={$appStore.currentUser}
-              showAdminLink={$appStore.currentUser?.role === "admin"}
-              on:logout={() => appStore.logout()}
-              on:openAdmin={() => appStore.openAdminConsole("dashboard")}
-            />
+              <button
+                type="button"
+                class="grid h-full w-10 shrink-0 place-items-center border-r border-slate-200/80 text-slate-500 transition hover:bg-white hover:text-slate-900"
+                aria-label="Create new root page"
+                title="Create new root page"
+                on:click={() => appStore.createPage()}
+              >
+                <span class="material-symbols-rounded text-[18px]">add</span>
+              </button>
+            </div>
           </div>
-        </div>
+        {:else}
+          <div class="mx-auto flex min-h-[4.5rem] max-w-[1280px] flex-wrap items-center justify-end gap-4 px-6 py-3 sm:px-8 lg:px-12 xl:px-16">
+            <div class="flex min-w-0 items-center gap-3">
+              <AccountMenu
+                align="right"
+                borderlessTrigger={true}
+                currentUser={$appStore.currentUser}
+                showAdminLink={$appStore.currentUser?.role === "admin"}
+                on:logout={() => appStore.logout()}
+                on:openAdmin={() => appStore.openAdminConsole("dashboard")}
+              />
+            </div>
+          </div>
+        {/if}
       </header>
 
-      <div class="mx-auto flex max-w-[1280px] gap-6 px-6 pt-6 sm:px-8 sm:pt-8 lg:px-12 lg:pt-8 xl:px-16">
-        <aside class={`${sidebarHidden ? "hidden" : "hidden lg:block"} min-h-0 w-[320px] shrink-0`}>
-          <div class="sticky top-[6.25rem]">
-            <ProjectSidebar
-              pages={$appStore.pages}
-              searchQuery={$appStore.searchQuery}
-              selectedPageId={$appStore.selectedPageId}
-              on:createFolder={(event) => appStore.createFolder(event.detail.parentId)}
-              on:createPage={(event) => appStore.createPage(event.detail.parentId)}
-              on:deletePages={(event) => {
-                if (window.confirm(`선택한 ${event.detail.pageIds.length}개 항목을 삭제할까요? 하위 페이지도 함께 삭제됩니다.`)) {
-                  appStore.deletePages(event.detail.pageIds);
-                }
-              }}
-              on:duplicatePages={(event) => appStore.duplicatePages(event.detail.pageIds)}
-              on:movePages={(event) =>
-                appStore.movePages(event.detail.pageIds, event.detail.parentId, event.detail.position)}
-              on:openMoveDialog={(event) => openMoveDialog(event.detail.pageIds)}
-              on:renamePage={(event) => appStore.renamePage(event.detail.pageId, event.detail.title)}
-              on:search={(event) => appStore.setSearchQuery(event.detail)}
-              on:selectPage={(event) => appStore.selectPage(event.detail)}
-              on:toggleSidebar={() => {
-                sidebarHidden = true;
-              }}
-            />
-          </div>
-        </aside>
+      <div class={shellLayoutClass}>
+        {#if $appStore.route === "page"}
+          <aside class="min-h-0 w-[320px] shrink-0">
+            <div class="h-full">
+              <ProjectSidebar
+                currentUser={$appStore.currentUser}
+                docked={true}
+                pages={$appStore.pages}
+                searchQuery={$appStore.searchQuery}
+                selectedPageId={$appStore.selectedPageId}
+                showAdminLink={$appStore.currentUser?.role === "admin"}
+                on:createFolder={(event) => appStore.createFolder(event.detail.parentId)}
+                on:createPage={(event) => appStore.createPage(event.detail.parentId)}
+                on:deletePages={handleDeletePages}
+                on:duplicatePages={(event) => appStore.duplicatePages(event.detail.pageIds)}
+                on:movePages={(event) =>
+                  appStore.movePages(event.detail.pageIds, event.detail.parentId, event.detail.position)}
+                on:aiApplied={() => appStore.refreshActiveProject()}
+                on:logout={() => appStore.logout()}
+                on:openAdmin={() => appStore.openAdminConsole("dashboard")}
+                on:openMoveDialog={(event) => openMoveDialog(event.detail.pageIds)}
+                on:renamePage={(event) => appStore.renamePage(event.detail.pageId, event.detail.title)}
+                on:search={(event) => appStore.setSearchQuery(event.detail)}
+                on:selectPage={(event) => handleSelectPage(event.detail)}
+              />
+            </div>
+          </aside>
+        {/if}
 
-        <main class="min-h-0 min-w-0 flex-1">
+        <main class="flex min-h-0 min-w-0 flex-1 flex-col">
           {#if $appStore.route === "project-home"}
             <ProjectHomeView
               groups={$appStore.groups}
@@ -246,7 +293,7 @@
               project={$appStore.activeProject}
               savingPage={$appStore.savingPage}
               selectedPage={$appStore.selectedPage}
-              on:createPage={(event) => appStore.createPage(event.detail)}
+              on:aiApplied={() => appStore.refreshActiveProject()}
               on:deletePage={(event) => {
                 if (window.confirm("이 페이지를 삭제할까요? 하위 페이지도 함께 삭제됩니다.")) {
                   appStore.deletePage(event.detail);
@@ -282,49 +329,6 @@
           {/if}
         </main>
       </div>
-
-      {#if pagesPanelOpen}
-        <button
-          type="button"
-          class="fixed inset-0 z-30 bg-black/35"
-          aria-label="Close pages panel"
-          on:click={closePagesPanel}
-          transition:fade={{ duration: 140 }}
-        ></button>
-
-        <div
-          class="fixed inset-y-0 left-0 z-40 w-[320px] max-w-[88vw] bg-white shadow-[0_24px_60px_rgba(15,23,42,0.18)]"
-          in:fly={{ x: -24, duration: 180 }}
-          out:fly={{ x: -24, duration: 140 }}
-        >
-          <div class="flex h-full min-h-0 flex-col px-4 py-5">
-            <ProjectSidebar
-              pages={$appStore.pages}
-              searchQuery={$appStore.searchQuery}
-              selectedPageId={$appStore.selectedPageId}
-              on:createFolder={(event) => appStore.createFolder(event.detail.parentId)}
-              on:createPage={(event) => appStore.createPage(event.detail.parentId)}
-              on:deletePages={(event) => {
-                if (window.confirm(`선택한 ${event.detail.pageIds.length}개 항목을 삭제할까요? 하위 페이지도 함께 삭제됩니다.`)) {
-                  closePagesPanel();
-                  appStore.deletePages(event.detail.pageIds);
-                }
-              }}
-              on:duplicatePages={(event) => appStore.duplicatePages(event.detail.pageIds)}
-              on:movePages={(event) =>
-                appStore.movePages(event.detail.pageIds, event.detail.parentId, event.detail.position)}
-              on:openMoveDialog={(event) => openMoveDialog(event.detail.pageIds)}
-              on:renamePage={(event) => appStore.renamePage(event.detail.pageId, event.detail.title)}
-              on:search={(event) => appStore.setSearchQuery(event.detail)}
-              on:selectPage={(event) => {
-                closePagesPanel();
-                appStore.selectPage(event.detail);
-              }}
-              on:toggleSidebar={closePagesPanel}
-            />
-          </div>
-        </div>
-      {/if}
 
       {#if moveDialogPageIds.length > 0}
         <MovePagesDialog

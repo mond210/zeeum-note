@@ -39,6 +39,20 @@ export function normalizeTitle(value, fallback = "Untitled page") {
   return normalized.slice(0, 120) || fallback;
 }
 
+export function formatFileSize(value) {
+  const size = Number(value || 0);
+
+  if (!Number.isFinite(size) || size <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  const exponent = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  const normalized = size / 1024 ** exponent;
+
+  return `${normalized >= 10 || exponent === 0 ? normalized.toFixed(0) : normalized.toFixed(1)} ${units[exponent]}`;
+}
+
 export function countWords(text) {
   return text.trim().split(/\s+/).filter(Boolean).length;
 }

@@ -22,6 +22,7 @@
   export let disabled = false;
   export let placeholder = "Start writing...";
   export let projectId = null;
+  export let toolbarItems = [];
 
   const dispatch = createEventDispatcher();
 
@@ -35,6 +36,7 @@
   let mediaDialog = null;
   let mediaMenu = null;
   let provider;
+  let toolbarVersion = 0;
   let uploading = false;
   let ydoc;
 
@@ -267,6 +269,10 @@
     return palette[seed % palette.length];
   }
 
+  function refreshToolbar() {
+    toolbarVersion += 1;
+  }
+
   function collaborationRoom() {
     if (!projectId || !documentId) {
       return "";
@@ -462,6 +468,15 @@
             ]
           : [])
       ],
+      onCreate() {
+        refreshToolbar();
+      },
+      onSelectionUpdate() {
+        refreshToolbar();
+      },
+      onTransaction() {
+        refreshToolbar();
+      },
       onUpdate() {
         if (!collaborationEnabled) {
           emitChange();
@@ -486,113 +501,91 @@
     applyIncomingContent();
   }
 
-  $: toolbarItems = [
-    {
-      action: () => editor?.chain().focus().toggleBold().run(),
-      active: editor?.isActive("bold"),
-      icon: "format_bold",
-      label: "Bold"
-    },
-    {
-      action: () => editor?.chain().focus().toggleItalic().run(),
-      active: editor?.isActive("italic"),
-      icon: "format_italic",
-      label: "Italic"
-    },
-    {
-      action: () => editor?.chain().focus().toggleStrike().run(),
-      active: editor?.isActive("strike"),
-      icon: "strikethrough_s",
-      label: "Strike"
-    },
-    {
-      action: () => editor?.chain().focus().toggleHeading({ level: 1 }).run(),
-      active: editor?.isActive("heading", { level: 1 }),
-      icon: "format_h1",
-      label: "Heading 1"
-    },
-    {
-      action: () => editor?.chain().focus().toggleHeading({ level: 2 }).run(),
-      active: editor?.isActive("heading", { level: 2 }),
-      icon: "format_h2",
-      label: "Heading 2"
-    },
-    {
-      action: () => editor?.chain().focus().toggleBulletList().run(),
-      active: editor?.isActive("bulletList"),
-      icon: "format_list_bulleted",
-      label: "Bulleted list"
-    },
-    {
-      action: () => editor?.chain().focus().toggleOrderedList().run(),
-      active: editor?.isActive("orderedList"),
-      icon: "format_list_numbered",
-      label: "Numbered list"
-    },
-    {
-      action: () => editor?.chain().focus().toggleTaskList().run(),
-      active: editor?.isActive("taskList"),
-      icon: "checklist",
-      label: "Checklist"
-    },
-    {
-      action: () => editor?.chain().focus().toggleBlockquote().run(),
-      active: editor?.isActive("blockquote"),
-      icon: "format_quote",
-      label: "Quote"
-    },
-    {
-      action: () => editor?.chain().focus().toggleCodeBlock().run(),
-      active: editor?.isActive("codeBlock"),
-      icon: "code_blocks",
-      label: "Code block"
-    },
-    {
-      action: () => promptLink(),
-      active: editor?.isActive("link"),
-      icon: "link",
-      label: "Link"
-    },
-    {
-      action: () => editor?.chain().focus().setHorizontalRule().run(),
-      active: false,
-      icon: "horizontal_rule",
-      label: "Divider"
-    }
-  ];
+  $: {
+    toolbarVersion;
+    toolbarItems = [
+      {
+        action: () => editor?.chain().focus().toggleBold().run(),
+        active: editor?.isActive("bold"),
+        icon: "format_bold",
+        label: "Bold"
+      },
+      {
+        action: () => editor?.chain().focus().toggleItalic().run(),
+        active: editor?.isActive("italic"),
+        icon: "format_italic",
+        label: "Italic"
+      },
+      {
+        action: () => editor?.chain().focus().toggleStrike().run(),
+        active: editor?.isActive("strike"),
+        icon: "strikethrough_s",
+        label: "Strike"
+      },
+      {
+        action: () => editor?.chain().focus().toggleHeading({ level: 1 }).run(),
+        active: editor?.isActive("heading", { level: 1 }),
+        icon: "format_h1",
+        label: "Heading 1"
+      },
+      {
+        action: () => editor?.chain().focus().toggleHeading({ level: 2 }).run(),
+        active: editor?.isActive("heading", { level: 2 }),
+        icon: "format_h2",
+        label: "Heading 2"
+      },
+      {
+        action: () => editor?.chain().focus().toggleBulletList().run(),
+        active: editor?.isActive("bulletList"),
+        icon: "format_list_bulleted",
+        label: "Bulleted list"
+      },
+      {
+        action: () => editor?.chain().focus().toggleOrderedList().run(),
+        active: editor?.isActive("orderedList"),
+        icon: "format_list_numbered",
+        label: "Numbered list"
+      },
+      {
+        action: () => editor?.chain().focus().toggleTaskList().run(),
+        active: editor?.isActive("taskList"),
+        icon: "checklist",
+        label: "Checklist"
+      },
+      {
+        action: () => editor?.chain().focus().toggleBlockquote().run(),
+        active: editor?.isActive("blockquote"),
+        icon: "format_quote",
+        label: "Quote"
+      },
+      {
+        action: () => editor?.chain().focus().toggleCodeBlock().run(),
+        active: editor?.isActive("codeBlock"),
+        icon: "code_blocks",
+        label: "Code block"
+      },
+      {
+        action: () => promptLink(),
+        active: editor?.isActive("link"),
+        icon: "link",
+        label: "Link"
+      },
+      {
+        action: () => editor?.chain().focus().setHorizontalRule().run(),
+        active: false,
+        icon: "horizontal_rule",
+        label: "Divider"
+      }
+    ];
+  }
 </script>
 
-<div class="relative pb-24">
+<div class="relative">
   <div bind:this={element} data-collab-ready={collabReady ? "true" : "false"}></div>
 
   {#if uploading}
     <div class="pointer-events-none absolute right-0 top-0 rounded-full bg-slate-950 px-3 py-1.5 text-xs font-semibold text-white">
       Uploading…
-    </div>
-  {/if}
-
-  {#if editor}
-    <div class="pointer-events-none fixed bottom-6 left-1/2 z-30 -translate-x-1/2">
-      <div class="pointer-events-auto flex items-center gap-1 rounded-full border border-slate-200/80 bg-white/92 px-2 py-2 shadow-[0_16px_40px_rgba(15,23,42,0.14)] backdrop-blur-md">
-        {#each toolbarItems as item, index}
-          {#if index === 3 || index === 5 || index === 9}
-            <div class="mx-1 h-7 w-px bg-slate-200"></div>
-          {/if}
-          <button
-            type="button"
-            class={`grid h-10 w-10 place-items-center rounded-full transition ${
-              item.active
-                ? "bg-sky-700 text-white shadow-[0_8px_20px_rgba(3,105,161,0.28)]"
-                : "text-slate-500 hover:bg-slate-100 hover:text-slate-950"
-            }`}
-            aria-label={item.label}
-            title={item.label}
-            on:click={item.action}
-          >
-            <span class={`material-symbols-rounded ${item.active ? "is-filled" : ""}`}>{item.icon}</span>
-          </button>
-        {/each}
-      </div>
     </div>
   {/if}
 

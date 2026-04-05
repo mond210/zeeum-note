@@ -2,9 +2,12 @@
   import { api } from "../lib/api.js";
   import { createEventDispatcher } from "svelte";
   import { fade, scale } from "svelte/transition";
+  import { clickOutside } from "../lib/click-outside.js";
   import { formatRelativeDate } from "../lib/format.js";
   import { breadcrumbTrail } from "../lib/page-tree.js";
   import { markdownFromDoc } from "../lib/rich-doc.js";
+  import { scrollbarActivity } from "../lib/scrollbar-activity.js";
+  import EditorAiDialog from "./EditorAiDialog.svelte";
   import PageHistoryPanel from "./PageHistoryPanel.svelte";
   import RichTextEditor from "./RichTextEditor.svelte";
 
@@ -17,6 +20,8 @@
   export let selectedPage = null;
 
   const dispatch = createEventDispatcher();
+  let aiDialogOpen = false;
+  let editorToolbarItems = [];
   let historyOpen = false;
   let iconPickerOpen = false;
   let settingsMenuOpen = false;
@@ -37,7 +42,7 @@
     { value: "inventory_2", label: "Asset" }
   ];
 
-  $: breadcrumbs = selectedPage ? breadcrumbTrail(pages, selectedPage.id) : [];
+  $: breadcrumbs = selectedPage ? breadcrumbTrail(pages, selectedPage.id).slice(0, -1) : [];
   $: editorInstanceKey = `${selectedPage?.id || ""}:${pageDraft?.contentFormat || ""}`;
 
   function iconGlyph(value) {
@@ -78,29 +83,44 @@
 
 </script>
 
-<section>
-  <div class="bg-white px-6 py-7 sm:px-8">
+<svelte:window
+  on:keydown={(event) => {
+    if (event.key === "Escape") {
+      closeOverlays();
+    }
+  }}
+/>
+
+<section class="flex min-h-0 flex-1 flex-col bg-white">
+  <div class="flex min-h-0 flex-1 flex-col px-4 py-6 sm:px-5 lg:px-6">
     {#if selectedPage && pageDraft}
-      <div>
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <p class="text-[0.72rem] font-semibold uppercase tracking-[0.32em] text-sky-700">Editor</p>
-            <div class="mt-3 flex flex-wrap items-center gap-2 text-sm text-slate-400">
-              <span>{project?.name}</span>
-              {#each breadcrumbs as item}
-                <span>/</span>
-                <span>{item.title}</span>
-              {/each}
-            </div>
-            <p class="mt-2 text-sm leading-6 text-slate-500">
+      <div class="flex min-h-0 flex-1 flex-col">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            {#if breadcrumbs.length > 0}
+              <div class="flex flex-wrap items-center gap-2 text-sm text-slate-400">
+                {#each breadcrumbs as item, index}
+                  {#if index > 0}
+                    <span>/</span>
+                  {/if}
+                  <span>{item.title}</span>
+                {/each}
+              </div>
+            {/if}
+
+            <p class={`${breadcrumbs.length > 0 ? "mt-2" : ""} text-sm leading-6 text-slate-500`}>
               {savingPage ? "Autosaving…" : `Last saved ${formatRelativeDate(selectedPage.updatedAt)}`}
             </p>
           </div>
 
-          <div class="relative flex items-center gap-2">
+          <div
+            class="relative shrink-0"
+            use:clickOutside={settingsMenuOpen}
+            on:clickoutside={() => (settingsMenuOpen = false)}
+          >
             <button
               type="button"
-              class="grid h-11 w-11 place-items-center rounded-full border border-slate-200 bg-white text-slate-600 transition hover:border-sky-300 hover:text-sky-700"
+              class="grid h-9 w-9 place-items-center text-slate-600 transition hover:bg-slate-100 hover:text-sky-700"
               aria-label="More"
               title="More"
               on:click={() => {
@@ -140,17 +160,6 @@
                   class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-slate-700 transition hover:bg-slate-100"
                   on:click={() => {
                     closeOverlays();
-                    dispatch("createPage", selectedPage.id);
-                  }}
-                >
-                  <span class="material-symbols-rounded">subdirectory_arrow_right</span>
-                  <span>New child page</span>
-                </button>
-                <button
-                  type="button"
-                  class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-medium text-slate-700 transition hover:bg-slate-100"
-                  on:click={() => {
-                    closeOverlays();
                     const blob = new Blob([markdownFromDoc(pageDraft?.content) || ""], { type: "text/markdown;charset=utf-8" });
                     const url = URL.createObjectURL(blob);
                     const anchor = document.createElement("a");
@@ -178,54 +187,91 @@
             {/if}
           </div>
         </div>
-      </div>
 
-      <div class="mt-8 flex items-start gap-4">
-        <button
-          type="button"
-          class="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-slate-100 text-slate-600 transition hover:bg-slate-200 hover:text-slate-900"
-          aria-label="Change page icon"
-          title="Change page icon"
-          on:click={() => {
-            settingsMenuOpen = false;
-            iconPickerOpen = true;
-          }}
-        >
-          <span class="material-symbols-rounded">{iconGlyph(pageDraft.icon)}</span>
-        </button>
-        <input
-          class="w-full bg-transparent text-slate-950 outline-none placeholder:text-slate-300"
-          style="font-family: var(--font-serif); font-size: clamp(3rem, 5vw, 5rem); line-height: 0.95; font-weight: 600; letter-spacing: -0.09em;"
-          value={pageDraft.title}
-          placeholder="Untitled"
-          on:input={(event) => dispatch("draft", { title: event.currentTarget.value })}
-        />
-      </div>
-
-      <div class="mt-5">
-        {#if loadingPage}
-          <div class="grid min-h-[26rem] place-items-center rounded-[1.4rem] border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
-            Loading page content...
+        <div class="mt-4 flex shrink-0 items-center gap-4 border-y border-slate-200/80 py-2">
+          <div class="scroll-thin flex min-w-0 flex-1 items-center gap-x-1 overflow-x-auto" use:scrollbarActivity>
+            {#each editorToolbarItems as item, index}
+              {#if index === 3 || index === 5 || index === 9}
+                <div class="mx-2 hidden h-5 w-px bg-slate-200 sm:block"></div>
+              {/if}
+              <button
+                type="button"
+                class={`grid h-9 w-9 shrink-0 place-items-center text-sm transition ${
+                  item.active
+                    ? "text-sky-700"
+                    : "text-slate-500 hover:bg-slate-100 hover:text-slate-950"
+                }`}
+                aria-label={item.label}
+                title={item.label}
+                on:click={item.action}
+              >
+                <span class={`material-symbols-rounded ${item.active ? "is-filled" : ""}`}>{item.icon}</span>
+              </button>
+            {/each}
           </div>
-        {:else}
-          {#key editorInstanceKey}
-            <RichTextEditor
-              content={pageDraft.content}
-              contentFormat={pageDraft.contentFormat}
-              currentUser={currentUser}
-              documentId={selectedPage.id}
-              projectId={project?.id}
-              on:change={(event) => dispatch("draft", event.detail)}
-            />
-          {/key}
-        {/if}
+
+          <button
+            type="button"
+            class="grid h-9 w-9 shrink-0 place-items-center text-slate-600 transition hover:bg-slate-100 hover:text-sky-700"
+            aria-label="AI tools"
+            title="AI tools"
+            on:click={() => {
+              closeOverlays();
+              aiDialogOpen = true;
+            }}
+          >
+            <span class="material-symbols-rounded">auto_awesome</span>
+          </button>
+        </div>
+
+        <div class="mt-8 flex shrink-0 items-center gap-4">
+          <button
+            type="button"
+            class="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-slate-100 text-slate-600 transition hover:bg-slate-200 hover:text-slate-900"
+            aria-label="Change page icon"
+            title="Change page icon"
+            on:click={() => {
+              settingsMenuOpen = false;
+              iconPickerOpen = true;
+            }}
+          >
+            <span class="material-symbols-rounded">{iconGlyph(pageDraft.icon)}</span>
+          </button>
+          <input
+            class="h-12 w-full bg-transparent text-slate-950 outline-none placeholder:text-slate-300"
+            style="font-family: var(--font-serif); font-size: clamp(1.5rem, 2.4vw, 2rem); line-height: 1; font-weight: 600; letter-spacing: -0.05em;"
+            value={pageDraft.title}
+            placeholder="Untitled"
+            on:input={(event) => dispatch("draft", { title: event.currentTarget.value })}
+          />
+        </div>
+
+        <div class="scroll-thin mt-5 min-h-0 flex-1 overflow-y-auto" use:scrollbarActivity>
+        {#if loadingPage}
+            <div class="grid min-h-[26rem] place-items-center rounded-[1.4rem] border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
+              Loading page content...
+            </div>
+          {:else}
+            {#key editorInstanceKey}
+              <RichTextEditor
+                bind:toolbarItems={editorToolbarItems}
+                content={pageDraft.content}
+                contentFormat={pageDraft.contentFormat}
+                currentUser={currentUser}
+                documentId={selectedPage.id}
+                projectId={project?.id}
+                on:change={(event) => dispatch("draft", event.detail)}
+              />
+            {/key}
+          {/if}
+        </div>
       </div>
     {:else}
-      <div class="grid min-h-[30rem] place-items-center border border-dashed border-slate-300 bg-slate-50 px-8 py-12 text-center">
+      <div class="grid min-h-0 flex-1 place-items-center border border-dashed border-slate-300 bg-slate-50 px-8 py-12 text-center">
         <div>
           <p class="text-3xl font-semibold tracking-[-0.05em] text-slate-950">Pick a page from the sidebar</p>
           <p class="mt-3 text-sm leading-6 text-slate-500">
-            The project shell keeps navigation on the left and editing in the center.
+            페이지를 선택하면 바로 편집을 시작할 수 있습니다.
           </p>
         </div>
       </div>
@@ -234,6 +280,16 @@
 
   {#if historyOpen}
     <PageHistoryPanel revisions={revisions} on:close={() => (historyOpen = false)} />
+  {/if}
+
+  {#if aiDialogOpen && project?.id && selectedPage?.id}
+    <EditorAiDialog
+      pageId={selectedPage.id}
+      pageTitle={pageDraft?.title || selectedPage.title}
+      projectId={project.id}
+      on:applied={() => dispatch("aiApplied")}
+      on:close={() => (aiDialogOpen = false)}
+    />
   {/if}
 
   {#if iconPickerOpen}
